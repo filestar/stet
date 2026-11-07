@@ -875,6 +875,21 @@ impl Context {
         }
     }
 
+    /// `$error /command`: the operator or name the last error happened in,
+    /// as text (`moveto`, `/Foo`), or `None` when none was recorded.
+    pub fn error_command(&self) -> Option<String> {
+        let key = self.names.find(b"command")?;
+        let obj = self.dicts.get(self.dollar_error, &DictKey::Name(key))?;
+        match obj.value {
+            PsValue::Name(id) => Some(String::from_utf8_lossy(self.names.get_bytes(id)).into_owned()),
+            PsValue::Operator(op) => self
+                .operators
+                .get(op.0 as usize)
+                .map(|o| String::from_utf8_lossy(self.names.get_bytes(o.name)).into_owned()),
+            _ => None,
+        }
+    }
+
     /// Execute a PostScript procedure synchronously and return.
     pub fn exec_sync(&mut self, proc_obj: PsObject) -> Result<(), PsError> {
         let f = self.exec_sync_fn.expect("exec_sync not initialized");

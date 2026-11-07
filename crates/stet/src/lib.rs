@@ -424,7 +424,10 @@ impl Interpreter {
     fn named_error(&self, e: StetError) -> StetError {
         match &e {
             StetError::PostScript(m) if m == "stop" => match self.ctx.error_name() {
-                Some(n) => StetError::PostScript(n),
+                Some(n) => match self.ctx.error_command() {
+                    Some(c) => StetError::PostScript(format!("{n} in {c}")),
+                    None => StetError::PostScript(n),
+                },
                 None => e,
             },
             _ => e,
