@@ -790,14 +790,17 @@ pub fn op_renamefile(ctx: &mut Context) -> Result<(), PsError> {
         return Err(PsError::InvalidFileAccess);
     }
 
+    // Before the existence check: otherwise undefinedfilename versus
+    // invalidfileaccess tells a sandboxed document whether a path exists.
+    if !stet_fonts::host::host_access_allowed() {
+        return Err(PsError::InvalidFileAccess);
+    }
+
     // Check source file exists BEFORE popping
     if !std::path::Path::new(&old_name).exists() {
         return Err(PsError::UndefinedFilename);
     }
 
-    if !stet_fonts::host::host_access_allowed() {
-        return Err(PsError::InvalidFileAccess);
-    }
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     std::fs::rename(&old_name, &new_name).map_err(|_| PsError::UndefinedFilename)?;
