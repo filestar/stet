@@ -174,6 +174,7 @@ pub struct InterpreterBuilder {
     keep_partial: bool,
     text_extraction: TextExtraction,
     default_rendering_intent: RenderingIntent,
+    max_page_size_points: f64,
     #[cfg(feature = "render")]
     page_background: PageBackground,
 }
@@ -195,6 +196,7 @@ impl Interpreter {
             keep_partial: false,
             text_extraction: TextExtraction::Off,
             default_rendering_intent: RenderingIntent::RelativeColorimetric,
+            max_page_size_points: stet_core::context::DEFAULT_MAX_PAGE_SIZE_POINTS,
             #[cfg(feature = "render")]
             page_background: PageBackground::White,
         }
@@ -720,12 +722,25 @@ impl InterpreterBuilder {
         self
     }
 
+    /// Allow pages up to `points` a side (default 14400, 200 inches).
+    ///
+    /// A file that declares a larger `PageSize` or EPS bounding box is
+    /// clamped to it, and loses what lies beyond. Raise it when pages are not
+    /// rasterised at the file's size, or memory is bounded another way:
+    /// Illustrator artboards reach 16383 pt and its large canvas ten times
+    /// that. See [`Context::max_page_size_points`].
+    pub fn max_page_size(mut self, points: f64) -> Self {
+        self.max_page_size_points = points;
+        self
+    }
+
     /// Build the interpreter.
     pub fn build(self) -> Interpreter {
         let mut ctx = init::create_initialized_context(self.use_icc, self.suppress_output)
             .expect("interpreter initialization failed");
         ctx.text_extraction = self.text_extraction;
         ctx.set_default_rendering_intent(self.default_rendering_intent);
+        ctx.max_page_size_points = self.max_page_size_points;
         Interpreter {
             ctx,
             #[cfg(feature = "render")]

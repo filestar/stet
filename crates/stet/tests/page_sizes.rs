@@ -46,3 +46,19 @@ fn an_eps_page_is_its_bounding_box() {
                1 0 0 setrgbcolor 10 20 120 50 rectfill\n";
     assert_eq!(sizes(eps, 72.0), [(120, 50, [255, 0, 0])]);
 }
+
+/// Pages are clamped to 14400 pt a side by default; a host may allow larger ones, as an Illustrator
+/// artboard of 204 inches declares.
+#[test]
+fn the_page_size_limit_is_the_hosts_to_raise() {
+    let eps = "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 14688 20\n\
+               1 0 0 setrgbcolor 0 0 14688 20 rectfill\n";
+    let width = |interp: &mut Interpreter| {
+        interp.render_to_display_list(eps.as_bytes(), 72.0).unwrap()[0].width
+    };
+    assert_eq!(width(&mut Interpreter::new()), 14400);
+    assert_eq!(
+        width(&mut Interpreter::builder().max_page_size(16383.0).build()),
+        14688
+    );
+}
