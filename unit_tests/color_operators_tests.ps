@@ -317,10 +317,10 @@ not { (HSB values out of range) print } if
 currentcolorspace length 4 eq
 not { (Indexed currentcolorspace length != 4) print } if
 
-%% After setcolorspace, initial color should be index 0 resolved via palette
-%% Index 0 = <FF0000> = RGB(1.0, 0.0, 0.0) (red)
+%% After setcolorspace, the initial colour is index 0. currentcolor returns the index, the
+%% one component of an Indexed space, not the colour it looks up.
 [/Indexed /DeviceRGB 2 <FF0000 00FF00 0000FF>] setcolorspace
-currentcolor 3 array astore /length [3] assert  % Should have 3 components (resolved RGB)
+/currentcolor [0] assert
 
 %% setcolor with Indexed - set specific indices
 [/Indexed /DeviceRGB 2 <FF0000 00FF00 0000FF>] setcolorspace
@@ -717,17 +717,19 @@ icc_long /setcolorspace [icc_long /rangecheck] assert
 %% confirming that the resource IS found (vs. fallback when no resource).
 /DefaultCMYK [/DeviceCMYK] /ColorSpace defineresource pop
 
-%% --- Now enable UseCIEColor and test remapping ---
+%% --- Now enable UseCIEColor ---
+%% PLRM, "Remapping Device Colors to CIE": "Enabling UseCIEColor does not alter the current
+%% color space or current color values in the graphics state. The remapping ... is entirely
+%% internal", so currentcolorspace still reports the device space, as in Ghostscript. That
+%% the remapped space is used is checked by its painted effect, in
+%% crates/stet/tests/use_cie_color.rs.
 << /UseCIEColor true >> setpagedevice
 1.0 0.0 0.0 setrgbcolor
-currentcolorspace 0 get /CIEBasedABC eq
-not { (UseCIEColor: setrgbcolor should remap to CIEBasedABC) print } if
+/currentcolorspace [[/DeviceRGB]] assert
 /currentcolor [1.0 0.0 0.0] assert                    % Color values preserved
 
-%% --- setgray remapping: space changes, color value preserved ---
 0.5 setgray
-currentcolorspace 0 get /CIEBasedA eq
-not { (UseCIEColor: setgray should remap to CIEBasedA) print } if
+/currentcolorspace [[/DeviceGray]] assert
 /currentcolor [0.5] assert                             % Color value preserved
 
 %% --- setcmykcolor with DefaultCMYK as pass-through [/DeviceCMYK] ---
@@ -738,14 +740,12 @@ currentcolorspace 0 get /DeviceCMYK eq
 not { (UseCIEColor: setcmykcolor with pass-through DefaultCMYK should be DeviceCMYK) print } if
 /currentcolor [0.1 0.2 0.3 0.4] assert                % Color values preserved
 
-%% --- setcolorspace remapping for all three device spaces ---
+%% --- setcolorspace with a device space: the array given is the one reported ---
 [/DeviceRGB] setcolorspace
-currentcolorspace 0 get /CIEBasedABC eq
-not { (UseCIEColor: setcolorspace [/DeviceRGB] should remap to CIEBasedABC) print } if
+/currentcolorspace [[/DeviceRGB]] assert
 
 [/DeviceGray] setcolorspace
-currentcolorspace 0 get /CIEBasedA eq
-not { (UseCIEColor: setcolorspace [/DeviceGray] should remap to CIEBasedA) print } if
+/currentcolorspace [[/DeviceGray]] assert
 
 [/DeviceCMYK] setcolorspace
 currentcolorspace 0 get /DeviceCMYK eq
@@ -764,6 +764,30 @@ not { (UseCIEColor: Indexed space should NOT be remapped) print } if
 [/CIEBasedABC << /WhitePoint [0.9505 1 1.089] >>] setcolorspace
 currentcolorspace 0 get /CIEBasedABC eq
 not { (UseCIEColor: CIEBasedABC space should NOT be remapped) print } if
+
+%% --- The colour operators report the device colour, not what the default space made of it ---
+%% A DefaultRGB with its R and B rows swapped paints red as blue, and a DefaultGray whose
+%% MatrixA is all zeros paints every gray black, so a converted colour shows. Ghostscript
+%% reports the device colour throughout.
+/DefaultRGB [/CIEBasedABC << /WhitePoint [0.9505 1 1.089]
+  /MatrixABC [0.1805 0.0722 0.9505 0.3576 0.7152 0.1192 0.4124 0.2126 0.0193] >>]
+/ColorSpace defineresource pop
+/DefaultGray [/CIEBasedA << /WhitePoint [0.9505 1 1.089] /MatrixA [0 0 0] >>]
+/ColorSpace defineresource pop
+1 0 0 setrgbcolor
+/currentrgbcolor [1.0 0.0 0.0] assert
+/currentgray [0.3] assert
+1 setgray
+/currentgray [1.0] assert
+/currentrgbcolor [1.0 1.0 1.0] assert
+0 1 1 sethsbcolor
+/currenthsbcolor [0.0 1.0 1.0] assert
+%% setcolor in a remapped device space clips as that device space does.
+[/DeviceRGB] setcolorspace
+/currentcolor [0.0 0.0 0.0] assert
+2 -1 0.5 setcolor
+/currentcolor [1.0 0.0 0.5] assert
+/currentrgbcolor [1.0 0.0 0.5] assert
 
 %% --- Disable UseCIEColor — reverts to device spaces ---
 << /UseCIEColor false >> setpagedevice
@@ -806,5 +830,179 @@ not { (ProcessColorModel should be stored in page device) print } if
 /currentcolor [1.0 0.75 0.5] assert
 1 .5 0 (Orange) findrgbcustomcolor 0 setcustomcolor
 /currentcolor [1.0 1.0 1.0] assert
+
+%% A packed array, as Adobe's own procsets build the custom colour.
+.2 .4 .6 0 (Packed) 5 packedarray 1 setcustomcolor
+/currentcolor [0.2 0.4 0.6 0.0] assert
+
+%% A tint outside 0..1 is clamped, so the colour keeps its hue.
+/cc_cmyk .2 .4 .6 .1 (Beige) findcmykcustomcolor def
+cc_cmyk 2 setcustomcolor
+/currentcolor [0.2 0.4 0.6 0.1] assert
+cc_cmyk -1 setcustomcolor
+/currentcolor [0.0 0.0 0.0 0.0] assert
+
+%% A null tint, which older Adobe procsets pass, leaves the colour as it was.
+.5 .5 .5 setrgbcolor
+cc_cmyk null /setcustomcolor [] assert
+/currentcolorspace [[/DeviceRGB]] assert
+/currentcolor [0.5 0.5 0.5] assert
+
+%% Error conditions: the operands stay on the stack.
+/setcustomcolor [/stackunderflow] assert
+0.5 /setcustomcolor [0.5 /stackunderflow] assert
+cc_cmyk (x) /setcustomcolor [cc_cmyk (x) /typecheck] assert
+(str) 0.5 /setcustomcolor [(str) 0.5 /typecheck] assert
+/cc_short [.2 .4 (Short)] def
+cc_short 0.5 /setcustomcolor [cc_short 0.5 /rangecheck] assert
+/cc_bad [.2 (x) .6 0 (Bad)] def
+cc_bad 0.5 /setcustomcolor [cc_bad 0.5 /typecheck] assert
+/cc_noread [.2 .4 .6 0 (NoRead)] noaccess def
+%% Checked by hand: assert compares the stack with eq, which refuses a no-access array.
+/cc_noread_result {
+    { cc_noread 0.5 setcustomcolor } stopped        % array 0.5 true
+    $error /newerror false put
+    $error /errorname get                            % array 0.5 true /invalidaccess
+    4 -1 roll type                                   % 0.5 true /invalidaccess /arraytype
+} def
+/cc_noread_result [0.5 true /invalidaccess /arraytype] assert
+[/cc_cmyk /cc_short /cc_bad /cc_noread /cc_noread_result] { userdict exch undef } forall
+
+%% =============================================================================
+%% currentcolor / currentcolorspace report what setcolor and setcolorspace took
+%% =============================================================================
+
+%% currentcolorspace hands back the array setcolorspace was given, itself, and keeps it
+%% through setcolor and gsave/grestore. A colour operator replaces it.
+/cc_sep [/Separation (Spot) /DeviceCMYK {dup 0 mul exch dup .91 mul exch dup .76 mul exch 0 mul}] def
+/cc_same { currentcolorspace cc_sep eq } def
+cc_sep setcolorspace
+/cc_same [true] assert
+0.5 setcolor
+/cc_same [true] assert
+gsave 0.2 setcolor grestore
+/cc_same [true] assert
+0.5 setgray
+/currentcolorspace [[/DeviceGray]] assert
+/cc_gray [/DeviceGray] def
+cc_gray setcolorspace 0.3 setcolor
+/cc_same_gray { currentcolorspace cc_gray eq } def
+/cc_same_gray [true] assert
+/DeviceRGB setcolorspace
+/currentcolorspace [[/DeviceRGB]] assert
+
+%% Separation and DeviceN: the tints, not the alternate-space colour; 1.0 before setcolor.
+cc_sep setcolorspace
+/currentcolor [1.0] assert
+0.5 setcolor
+/currentcolor [0.5] assert
+2 setcolor
+/currentcolor [1.0] assert
+[/DeviceN [/Cyan /Spot] /DeviceCMYK {0 0 4 2 roll}] setcolorspace
+/currentcolor [1.0 1.0] assert
+0.2 0.7 setcolor
+/currentcolor [0.2 0.7] assert
+%% A setcolor that fails leaves the colour that was current.
+cc_sep setcolorspace 0.4 setcolor
+(x) /setcolor [(x) /typecheck] assert
+/currentcolor [0.4] assert
+
+%% Indexed: the index, rounded and clipped to 0..hival, as an integer.
+[/Indexed /DeviceRGB 2 <ff000000ff000000ff>] setcolorspace
+/currentcolor [0] assert
+0.7 setcolor
+/currentcolor [1] assert
+9 setcolor
+/currentcolor [2] assert
+/cc_index_type { mark currentcolor type exch pop } def
+/cc_index_type [/integertype] assert
+
+%% CIE-based: the inputs clipped to the space's range; each starts at 0 clipped to it.
+[/CIEBasedABC << /WhitePoint [0.9505 1 1.089] /RangeABC [0.2 0.8 -1 1 0 1] >>] setcolorspace
+/currentcolor [0.2 0.0 0.0] assert
+5 -5 0.5 setcolor
+/currentcolor [0.8 -1.0 0.5] assert
+[/CIEBasedA << /WhitePoint [0.9505 1 1.089] /RangeA [0.25 2] >>] setcolorspace
+/currentcolor [0.25] assert
+3 setcolor
+/currentcolor [2.0] assert
+
+%% ICCBased without a profile stays ICCBased through setcolor.
+[/ICCBased << /N 3 >>] setcolorspace 0.2 0.3 0.4 setcolor
+/currentcolor [0.2 0.3 0.4] assert
+/cc_family { currentcolorspace 0 get } def
+/cc_family [/ICCBased] assert
+
+%% A Pattern space set by setpattern describes the space it was built on.
+/cc_family_base { currentcolorspace 1 get 0 get } def
+cc_sep setcolorspace
+<< /PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 1 1] /XStep 1 /YStep 1
+   /PaintProc { pop } >> matrix makepattern 0.3 exch setpattern
+/cc_family [/Pattern] assert
+/cc_family_base [/Separation] assert
+
+%% ICCBased with a profile: each component starts at 0 clipped to /Range (for CMYK, no ink,
+%% not the 0 0 0 1 DeviceCMYK starts at), and setcolor clips to /Range too.
+/cc_icc { << /N 4 /DataSource (crates/stet/resources/default_cmyk.icc) (r) file >> } def
+[/ICCBased cc_icc] setcolorspace
+/currentcolor [0.0 0.0 0.0 0.0] assert
+5 -1 0.5 0 setcolor
+/currentcolor [1.0 0.0 0.5 0.0] assert
+[/ICCBased cc_icc dup /Range [0.2 1 0 1 0 1 0 1] put] setcolorspace
+/currentcolor [0.2 0.0 0.0 0.0] assert
+0 0 0 0 setcolor
+/currentcolor [0.2 0.0 0.0 0.0] assert
+%% Without a profile the space stands for DeviceCMYK, and starts where it does.
+[/ICCBased << /N 4 >>] setcolorspace
+/currentcolor [0.0 0.0 0.0 1.0] assert
+
+%% A colour space may be a packed array, and so may any array inside one; currentcolorspace
+%% hands the packed array back.
+/cc_pk_sep /Separation /S /DeviceGray {} 4 packedarray def
+/cc_same_pk { currentcolorspace cc_pk_sep eq } def
+cc_pk_sep setcolorspace 0.4 setcolor
+/currentcolor [0.4] assert
+/cc_same_pk [true] assert
+/DeviceRGB 1 packedarray setcolorspace 0.1 0.2 0.3 setcolor
+/currentcolor [0.1 0.2 0.3] assert
+[/Indexed /Separation /S /DeviceGray {} 4 packedarray 1 <00ff>] setcolorspace 1 setcolor
+/currentcolor [1] assert
+[/Separation /S /DeviceRGB 1 packedarray {dup dup}] setcolorspace 0.5 setcolor
+/currentcolor [0.5] assert
+[/DeviceN /A /B 2 packedarray /DeviceGray {pop}] setcolorspace 0.2 0.3 setcolor
+/currentcolor [0.2 0.3] assert
+/Pattern /DeviceRGB 2 packedarray setcolorspace
+/cc_family [/Pattern] assert
+
+[/cc_sep /cc_same /cc_gray /cc_same_gray /cc_index_type /cc_family /cc_family_base
+ /cc_icc /cc_pk_sep /cc_same_pk]
+{ userdict exch undef } forall
+0 setgray
+
+%% =============================================================================
+%% CIEBasedDEF / CIEBasedDEFG tables (PLRM): errors for a table that does not match its dimensions
+%% =============================================================================
+
+/cie_wp { /WhitePoint [0.9505 1 1.089] } def
+%% A dimension must be an integer greater than 1.
+/cie_bad [/CIEBasedDEF << cie_wp /Table [1 2 2 [<000000000000000000000000>]] >>] def
+cie_bad /setcolorspace [cie_bad /rangecheck] assert
+%% A DEFG table is m1 arrays of m2 strings, not m1 strings.
+/cie_bad [/CIEBasedDEFG << cie_wp /Table [2 2 2 2 [<00> <00>]] >>] def
+cie_bad /setcolorspace [cie_bad /typecheck] assert
+%% Each string holds 3 bytes for every entry of the last two axes.
+/cie_bad [/CIEBasedDEFG << cie_wp
+  /Table [2 2 2 2 [[<000000000000000000000000> <00>] [<000000000000000000000000> <000000000000000000000000>]]] >>] def
+cie_bad /setcolorspace [cie_bad /rangecheck] assert
+/cie_bad [/CIEBasedDEF << cie_wp /Table [3 3 3 [<00>]] >>] def
+cie_bad /setcolorspace [cie_bad /rangecheck] assert
+%% Aliased arrays let a short program claim a table of any size; past 2^22 entries, limitcheck.
+/cie_s 12 string def
+/cie_a [ 4096 { cie_s } repeat ] def
+/cie_bad [/CIEBasedDEFG << cie_wp /Table [4096 4096 2 2 [ 4096 { cie_a } repeat ]] >>] def
+cie_bad /setcolorspace [cie_bad /limitcheck] assert
+%% The PLRM layout is accepted, and a whole-number real is taken for an integer.
+[/CIEBasedDEFG << cie_wp /Table [2.0 2 2 2 [[cie_s cie_s] [cie_s cie_s]]] >>] /setcolorspace [] assert
+[/cie_wp /cie_bad /cie_s /cie_a] { userdict exch undef } forall
 
 % Test completed - use the standard unittest framework summary

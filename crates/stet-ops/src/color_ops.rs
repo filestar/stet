@@ -36,72 +36,202 @@ pub fn clear_pattern_color(ctx: &mut Context) {
     ctx.gstate.pattern_components.clear();
 }
 
-/// `setgray`: num → —
-pub fn op_setgray(ctx: &mut Context) -> Result<(), PsError> {
+/// Make `space` current after `setgray`, `setrgbcolor`, `setcmykcolor` or
+/// `sethsbcolor` has set `comps` in it, remapped under UseCIEColor (PLRM
+/// 6.2.5).
+///
+/// A remapped colour is painted through the `Default*` space: `comps` go to
+/// that space's `setcolor`, as they would after `setcolorspace`, and the
+/// device colour already set is replaced by what it converts them to. The
+/// remapping is meant to be invisible otherwise, so `currentcolorspace` still
+/// reports the device space and `currentcolor` the components given. A
+/// default space that cannot take the colour — its `setcolor` fails — leaves
+/// the device space and colour in place.
+fn install_device_space(ctx: &mut Context, space: ColorSpace, name: &[u8], comps: &[f64]) {
+    ctx.gstate.color_space = space;
+    ctx.gstate.color_space_object = None;
+    if !is_use_cie_color(ctx) {
+        return;
+    }
+    let Some(default_space) = lookup_default_colorspace(ctx, name) else {
+        return;
+    };
+    let device_space = std::mem::replace(&mut ctx.gstate.color_space, default_space);
+    if paint_through_current_space(ctx, comps) {
+        ctx.gstate.color_space_object = Some(PsObject::name_lit(ctx.names.intern(name)));
+    } else {
+        ctx.gstate.color_space = device_space;
+        ctx.gstate.color_components = None;
+    }
+}
+
+/// Paint `comps`, a colour in a device space already set as `gstate.color`,
+/// through the current colour space: the `Default*` space UseCIEColor put in
+/// the device space's place. `currentcolor` reports `comps` either way.
+///
+/// `false`, leaving the device colour, when that space's `setcolor` fails.
+fn paint_through_current_space(ctx: &mut Context, comps: &[f64]) -> bool {
+    let device_color = ctx.gstate.color.clone();
+    let depth = ctx.o_stack.len();
+    let pushed = comps
+        .iter()
+        .all(|&c| ctx.o_stack.push(PsObject::real(c)).is_ok());
+    let painted = pushed && set_color_in_space(ctx).is_ok();
+    if !painted {
+        ctx.o_stack.truncate(depth);
+        ctx.gstate.color = device_color;
+    }
+    ctx.gstate.color_components = Some(Arc::from(comps));
+    painted
+}
+
+/// The device space the current colour space stands in for, when UseCIEColor
+/// has put a `Default*` space in its place: the device space `setcolorspace`
+/// or a colour operator named, while `color_space` holds the default.
+///
+/// `None` in any other space, including a device space a `Default*` resource
+/// left as it was (`[/DeviceCMYK]`, for no remapping).
+fn remapped_device_space(ctx: &Context) -> Option<ColorSpace> {
+    if matches!(
+        ctx.gstate.color_space,
+        ColorSpace::DeviceGray | ColorSpace::DeviceRGB | ColorSpace::DeviceCMYK
+    ) {
+        return None;
+    }
+    let obj = ctx.gstate.color_space_object?;
+    let family = match obj.value {
+        PsValue::Name(id) => id,
+        _ => match array_span(&obj)? {
+            (entity, start, 1) => match ctx.arrays.get_element(entity, start).value {
+                PsValue::Name(id) => id,
+                _ => return None,
+            },
+            _ => return None,
+        },
+    };
+    match ctx.names.get_bytes(family) {
+        b"DeviceGray" => Some(ColorSpace::DeviceGray),
+        b"DeviceRGB" => Some(ColorSpace::DeviceRGB),
+        b"DeviceCMYK" => Some(ColorSpace::DeviceCMYK),
+        _ => None,
+    }
+}
+
+/// `setcolor` in a device space UseCIEColor remapped: the device space's
+/// components, clipped as it clips them, painted through the `Default*` space.
+fn set_remapped_device_color(ctx: &mut Context, device: &ColorSpace) -> Result<(), PsError> {
+    let comps: Vec<f64> = match device {
+        ColorSpace::DeviceGray => set_gray_components(ctx)?.to_vec(),
+        ColorSpace::DeviceRGB => set_rgb_components(ctx)?.to_vec(),
+        _ => set_cmyk_components(ctx)?.to_vec(),
+    };
+    paint_through_current_space(ctx, &comps);
+    Ok(())
+}
+
+/// The device colour `currentgray`, `currentrgbcolor`, `currentcmykcolor`
+/// and `currenthsbcolor` describe.
+///
+/// That is `gstate.color`, except in a space UseCIEColor remapped, where
+/// `gstate.color` is what the `Default*` space converted the colour to. The
+/// PLRM keeps the remapping out of "the current color values", so these
+/// describe the device colour the program set, as Ghostscript does.
+fn reported_color(ctx: &mut Context) -> DeviceColor {
+    if let Some(device) = remapped_device_space(ctx)
+        && let Some(comps) = ctx.gstate.color_components.clone()
+    {
+        match (device, &comps[..]) {
+            (ColorSpace::DeviceGray, &[g]) => return DeviceColor::from_gray(g),
+            (ColorSpace::DeviceRGB, &[r, g, b]) => return DeviceColor::from_rgb(r, g, b),
+            (ColorSpace::DeviceCMYK, &[c, m, y, k]) => {
+                let intent = gstate_intent(ctx);
+                return DeviceColor::from_cmyk_icc_with_intent(
+                    c,
+                    m,
+                    y,
+                    k,
+                    intent,
+                    &mut ctx.icc_cache,
+                );
+            }
+            _ => {}
+        }
+    }
+    ctx.gstate.color.clone()
+}
+
+/// Pop a gray level and make it the current colour, leaving the colour
+/// space as it is: the part of `setgray` that `setcolor` shares.
+fn set_gray_components(ctx: &mut Context) -> Result<[f64; 1], PsError> {
     if ctx.o_stack.is_empty() {
         return Err(PsError::StackUnderflow);
     }
     let obj = ctx.o_stack.peek(0)?;
-    let gray = obj.as_f64().ok_or(PsError::TypeCheck)?;
+    let gray = obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
     ctx.o_stack.pop()?;
-    ctx.gstate.color = DeviceColor::from_gray(gray.clamp(0.0, 1.0));
-    ctx.gstate.color_space = ColorSpace::DeviceGray;
+    ctx.gstate.color = DeviceColor::from_gray(gray);
     ctx.gstate.icc_components = None;
+    ctx.gstate.color_components = None;
     clear_pattern_color(ctx);
-    // UseCIEColor remapping (PLRM 6.2.5)
-    if is_use_cie_color(ctx)
-        && let Some(cs) = lookup_default_colorspace(ctx, b"DeviceGray")
-    {
-        ctx.gstate.color_space = cs;
-    }
+    Ok([gray])
+}
+
+/// `setgray`: num → —
+pub fn op_setgray(ctx: &mut Context) -> Result<(), PsError> {
+    let comps = set_gray_components(ctx)?;
+    install_device_space(ctx, ColorSpace::DeviceGray, b"DeviceGray", &comps);
     Ok(())
 }
 
 /// `currentgray`: — → num
 pub fn op_currentgray(ctx: &mut Context) -> Result<(), PsError> {
-    let gray = ctx.gstate.color.to_gray();
+    let gray = reported_color(ctx).to_gray();
     ctx.o_stack.push(PsObject::real(gray))?;
     Ok(())
 }
 
-/// `setrgbcolor`: r g b → —
-pub fn op_setrgbcolor(ctx: &mut Context) -> Result<(), PsError> {
+/// Pop red, green and blue and make them the current colour, leaving the
+/// colour space as it is: the part of `setrgbcolor` that `setcolor` shares.
+fn set_rgb_components(ctx: &mut Context) -> Result<[f64; 3], PsError> {
     if ctx.o_stack.len() < 3 {
         return Err(PsError::StackUnderflow);
     }
     let b_obj = ctx.o_stack.peek(0)?;
     let g_obj = ctx.o_stack.peek(1)?;
     let r_obj = ctx.o_stack.peek(2)?;
-    let r = r_obj.as_f64().ok_or(PsError::TypeCheck)?;
-    let g = g_obj.as_f64().ok_or(PsError::TypeCheck)?;
-    let b = b_obj.as_f64().ok_or(PsError::TypeCheck)?;
+    let r = r_obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
+    let g = g_obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
+    let b = b_obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
-    ctx.gstate.color =
-        DeviceColor::from_rgb(r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0));
-    ctx.gstate.color_space = ColorSpace::DeviceRGB;
+    ctx.gstate.color = DeviceColor::from_rgb(r, g, b);
     ctx.gstate.icc_components = None;
+    ctx.gstate.color_components = None;
     clear_pattern_color(ctx);
-    // UseCIEColor remapping (PLRM 6.2.5)
-    if is_use_cie_color(ctx)
-        && let Some(cs) = lookup_default_colorspace(ctx, b"DeviceRGB")
-    {
-        ctx.gstate.color_space = cs;
-    }
+    Ok([r, g, b])
+}
+
+/// `setrgbcolor`: r g b → —
+pub fn op_setrgbcolor(ctx: &mut Context) -> Result<(), PsError> {
+    let comps = set_rgb_components(ctx)?;
+    install_device_space(ctx, ColorSpace::DeviceRGB, b"DeviceRGB", &comps);
     Ok(())
 }
 
 /// `currentrgbcolor`: — → r g b
 pub fn op_currentrgbcolor(ctx: &mut Context) -> Result<(), PsError> {
-    ctx.o_stack.push(PsObject::real(ctx.gstate.color.r))?;
-    ctx.o_stack.push(PsObject::real(ctx.gstate.color.g))?;
-    ctx.o_stack.push(PsObject::real(ctx.gstate.color.b))?;
+    let color = reported_color(ctx);
+    ctx.o_stack.push(PsObject::real(color.r))?;
+    ctx.o_stack.push(PsObject::real(color.g))?;
+    ctx.o_stack.push(PsObject::real(color.b))?;
     Ok(())
 }
 
-/// `setcmykcolor`: c m y k → —
-pub fn op_setcmykcolor(ctx: &mut Context) -> Result<(), PsError> {
+/// Pop cyan, magenta, yellow and black and make them the current colour,
+/// converted through the system CMYK profile, leaving the colour space as it
+/// is: the part of `setcmykcolor` that `setcolor` shares.
+fn set_cmyk_components(ctx: &mut Context) -> Result<[f64; 4], PsError> {
     if ctx.o_stack.len() < 4 {
         return Err(PsError::StackUnderflow);
     }
@@ -109,38 +239,33 @@ pub fn op_setcmykcolor(ctx: &mut Context) -> Result<(), PsError> {
     let y_obj = ctx.o_stack.peek(1)?;
     let m_obj = ctx.o_stack.peek(2)?;
     let c_obj = ctx.o_stack.peek(3)?;
-    let c = c_obj.as_f64().ok_or(PsError::TypeCheck)?;
-    let m = m_obj.as_f64().ok_or(PsError::TypeCheck)?;
-    let y = y_obj.as_f64().ok_or(PsError::TypeCheck)?;
-    let k = k_obj.as_f64().ok_or(PsError::TypeCheck)?;
+    let c = c_obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
+    let m = m_obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
+    let y = y_obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
+    let k = k_obj.as_f64().ok_or(PsError::TypeCheck)?.clamp(0.0, 1.0);
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     let intent = gstate_intent(ctx);
-    ctx.gstate.color = DeviceColor::from_cmyk_icc_with_intent(
-        c.clamp(0.0, 1.0),
-        m.clamp(0.0, 1.0),
-        y.clamp(0.0, 1.0),
-        k.clamp(0.0, 1.0),
-        intent,
-        &mut ctx.icc_cache,
-    );
-    ctx.gstate.color_space = ColorSpace::DeviceCMYK;
+    ctx.gstate.color =
+        DeviceColor::from_cmyk_icc_with_intent(c, m, y, k, intent, &mut ctx.icc_cache);
     ctx.gstate.icc_components = None;
+    ctx.gstate.color_components = None;
     clear_pattern_color(ctx);
-    // UseCIEColor remapping (PLRM 6.2.5)
-    if is_use_cie_color(ctx)
-        && let Some(cs) = lookup_default_colorspace(ctx, b"DeviceCMYK")
-    {
-        ctx.gstate.color_space = cs;
-    }
+    Ok([c, m, y, k])
+}
+
+/// `setcmykcolor`: c m y k → —
+pub fn op_setcmykcolor(ctx: &mut Context) -> Result<(), PsError> {
+    let comps = set_cmyk_components(ctx)?;
+    install_device_space(ctx, ColorSpace::DeviceCMYK, b"DeviceCMYK", &comps);
     Ok(())
 }
 
 /// `currentcmykcolor`: — → c m y k
 pub fn op_currentcmykcolor(ctx: &mut Context) -> Result<(), PsError> {
-    let (c, m, y, k) = ctx.gstate.color.to_cmyk();
+    let (c, m, y, k) = reported_color(ctx).to_cmyk();
     ctx.o_stack.push(PsObject::real(c))?;
     ctx.o_stack.push(PsObject::real(m))?;
     ctx.o_stack.push(PsObject::real(y))?;
@@ -164,15 +289,18 @@ pub fn op_sethsbcolor(ctx: &mut Context) -> Result<(), PsError> {
     ctx.o_stack.pop()?;
     ctx.gstate.color =
         DeviceColor::from_hsb(h.clamp(0.0, 1.0), s.clamp(0.0, 1.0), b.clamp(0.0, 1.0));
-    ctx.gstate.color_space = ColorSpace::DeviceRGB;
     ctx.gstate.icc_components = None;
+    ctx.gstate.color_components = None;
     clear_pattern_color(ctx);
+    // `sethsbcolor` sets an RGB colour, so a remap takes its RGB components.
+    let comps = [ctx.gstate.color.r, ctx.gstate.color.g, ctx.gstate.color.b];
+    install_device_space(ctx, ColorSpace::DeviceRGB, b"DeviceRGB", &comps);
     Ok(())
 }
 
 /// `currenthsbcolor`: — → h s b
 pub fn op_currenthsbcolor(ctx: &mut Context) -> Result<(), PsError> {
-    let (h, s, b) = ctx.gstate.color.to_hsb();
+    let (h, s, b) = reported_color(ctx).to_hsb();
     ctx.o_stack.push(PsObject::real(h))?;
     ctx.o_stack.push(PsObject::real(s))?;
     ctx.o_stack.push(PsObject::real(b))?;
@@ -211,12 +339,16 @@ pub fn op_setcolorspace(ctx: &mut Context) -> Result<(), PsError> {
                 }
             }
             ctx.gstate.color = default_color_for_space(&cs, ctx);
+            ctx.gstate.color_components = initial_components(ctx, &cs);
             ctx.gstate.color_space = cs;
+            ctx.gstate.color_space_object = Some(obj);
             clear_pattern_color(ctx);
+            install_remapped_initial_color(ctx);
             Ok(())
         }
-        // Also accept array form [/DeviceGray] or [/Indexed base hival lookup]
-        PsValue::Array { entity, start, len } => {
+        // Also accept array form [/DeviceGray] or [/Indexed base hival lookup],
+        // a packed array as well as a plain one.
+        PsValue::Array { entity, start, len } | PsValue::PackedArray { entity, start, len } => {
             obj.flags.require_read()?;
             if len == 0 {
                 return Err(PsError::RangeCheck);
@@ -260,9 +392,13 @@ pub fn op_setcolorspace(ctx: &mut Context) -> Result<(), PsError> {
                 };
                 ctx.o_stack.pop()?;
                 ctx.gstate.color = default_color_for_space(&cs, ctx);
+                ctx.gstate.color_components = initial_components(ctx, &cs);
                 ctx.gstate.color_space = cs;
+                ctx.gstate.color_space_object = Some(obj);
                 clear_pattern_color(ctx);
                 cache_tint_table(ctx);
+                install_initial_tints(ctx);
+                install_remapped_initial_color(ctx);
                 Ok(())
             } else {
                 Err(PsError::TypeCheck)
@@ -270,6 +406,84 @@ pub fn op_setcolorspace(ctx: &mut Context) -> Result<(), PsError> {
         }
         _ => Err(PsError::TypeCheck),
     }
+}
+
+/// The components of the initial colour `setcolorspace` installs, as
+/// `currentcolor` reports them (PLRM, `setcolorspace`): each component of
+/// a CIE-based space is 0 clipped to its range, an Indexed space starts at
+/// index 0, and a Separation or DeviceN space at tint 1.0 for every colorant.
+///
+/// `None` for the spaces whose components `gstate.color` holds; see
+/// [`GraphicsState::color_components`](stet_core::graphics_state::GraphicsState::color_components).
+/// An ICCBased space with a profile reports the components
+/// [`default_color_for_space`] converted, so call this after it.
+fn initial_components(ctx: &Context, cs: &ColorSpace) -> Option<Arc<[f64]>> {
+    let zero_in = |range: &[f64]| clamp_to_ranges(&vec![0.0; range.len() / 2], range);
+    match cs {
+        ColorSpace::CIEBasedABC { params, .. } => Some(zero_in(&params.range_abc)),
+        ColorSpace::CIEBasedA { params, .. } => Some(zero_in(&params.range_a)),
+        ColorSpace::CIEBasedDEF { params, .. } => Some(zero_in(&params.range_def)),
+        ColorSpace::CIEBasedDEFG { params, .. } => Some(zero_in(&params.range_defg)),
+        ColorSpace::ICCBased { .. } => ctx.gstate.icc_components.as_deref().map(Arc::from),
+        ColorSpace::Indexed { .. } => Some(Arc::from([0.0])),
+        ColorSpace::Separation { .. } => Some(Arc::from([1.0])),
+        ColorSpace::DeviceN { num_colorants, .. } => {
+            Some(vec![1.0; *num_colorants as usize].into())
+        }
+        ColorSpace::DeviceGray
+        | ColorSpace::DeviceRGB
+        | ColorSpace::DeviceCMYK
+        | ColorSpace::Pattern { .. } => None,
+    }
+}
+
+/// Paint the initial colour of a device space UseCIEColor remapped: the
+/// device space's own initial colour — black, `0 0 0 1` for DeviceCMYK —
+/// through the `Default*` space, rather than that space's initial colour,
+/// which for a CIEBasedDEFG `DefaultCMYK` is all zeros, no ink.
+fn install_remapped_initial_color(ctx: &mut Context) {
+    let Some(device) = remapped_device_space(ctx) else {
+        return;
+    };
+    let comps: &[f64] = match device {
+        ColorSpace::DeviceGray => &[0.0],
+        ColorSpace::DeviceRGB => &[0.0, 0.0, 0.0],
+        _ => &[0.0, 0.0, 0.0, 1.0],
+    };
+    let intent = gstate_intent(ctx);
+    ctx.gstate.color = match device {
+        ColorSpace::DeviceGray => DeviceColor::from_gray(0.0),
+        ColorSpace::DeviceRGB => DeviceColor::from_rgb(0.0, 0.0, 0.0),
+        _ => DeviceColor::from_cmyk_icc_with_intent(0.0, 0.0, 0.0, 1.0, intent, &mut ctx.icc_cache),
+    };
+    ctx.gstate.icc_components = None;
+    paint_through_current_space(ctx, comps);
+}
+
+/// Paint the initial colour of a Separation or DeviceN space: every tint 1.0,
+/// put through the tint transform as `setcolor` would (PLRM, `setcolorspace`).
+///
+/// Ghostscript runs the transform when the colour is first painted rather
+/// than here, so a transform that fails must not fail `setcolorspace`: the
+/// colour is then left black, as it was before the space had an initial
+/// colour at all. [`cache_tint_table`] has already run the same transform
+/// across its whole range by this point, so this adds no failure it could
+/// not have hit.
+fn install_initial_tints(ctx: &mut Context) {
+    let n = match &ctx.gstate.color_space {
+        ColorSpace::Separation { .. } => 1,
+        ColorSpace::DeviceN { num_colorants, .. } => *num_colorants as usize,
+        _ => return,
+    };
+    let depth = ctx.o_stack.len();
+    let pushed = (0..n).all(|_| ctx.o_stack.push(PsObject::real(1.0)).is_ok());
+    if pushed && op_setcolor(ctx).is_ok() {
+        return;
+    }
+    ctx.o_stack.truncate(depth);
+    ctx.gstate.color = DeviceColor::black();
+    ctx.gstate.tint_values = Some(vec![1.0; n]);
+    ctx.gstate.color_components = Some(vec![1.0; n].into());
 }
 
 /// Sample and cache the tint transform for Separation/DeviceN color spaces.
@@ -306,18 +520,49 @@ fn cache_tint_table(ctx: &mut Context) {
 }
 
 /// `currentcolorspace`: — → array
+///
+/// The array `setcolorspace` was given, itself, as Ghostscript returns it; a
+/// space set by name, or by a colour operator such as `setgray`, comes back
+/// as a new one-element array.
 pub fn op_currentcolorspace(ctx: &mut Context) -> Result<(), PsError> {
-    let cs = ctx.gstate.color_space.clone();
-    let obj = colorspace_object(ctx, &cs)?;
+    let obj = match ctx.gstate.color_space_object {
+        Some(obj) if obj.is_array_type() => obj,
+        Some(PsObject {
+            value: PsValue::Name(id),
+            ..
+        }) => {
+            let entity = crate::vm_ops::alloc_array_from(ctx, &[PsObject::name_lit(id)]);
+            crate::vm_ops::make_array_obj(ctx, entity, 1)
+        }
+        _ => {
+            let cs = ctx.gstate.color_space.clone();
+            colorspace_object(ctx, &cs)?
+        }
+    };
     ctx.o_stack.push(obj)?;
     Ok(())
 }
 
+/// The operand that names `cs` inside another space's array — the base of an
+/// Indexed space, the alternative space of a Separation or DeviceN one: the
+/// family name for a device space, as programs write it, and the whole array
+/// for any other.
+fn nested_space_object(ctx: &mut Context, cs: &ColorSpace) -> Result<PsObject, PsError> {
+    let device = match cs {
+        ColorSpace::DeviceGray => b"DeviceGray" as &[u8],
+        ColorSpace::DeviceRGB => b"DeviceRGB",
+        ColorSpace::DeviceCMYK => b"DeviceCMYK",
+        _ => return colorspace_object(ctx, cs),
+    };
+    Ok(PsObject::name_lit(ctx.names.intern(device)))
+}
+
 /// Rebuild the PostScript array that names a color space.
 ///
-/// `currentcolorspace` hands this back to the program, and a Pattern space
-/// embeds the result for its base space, so it has to be able to describe
-/// every variant.
+/// `currentcolorspace` hands this back when there is no array from
+/// `setcolorspace` to return, and a Pattern, Indexed, Separation or DeviceN
+/// space embeds the result for the space it is built on, so it has to be able
+/// to describe every variant.
 fn colorspace_object(ctx: &mut Context, cs: &ColorSpace) -> Result<PsObject, PsError> {
     let obj = match cs {
         ColorSpace::Indexed {
@@ -330,22 +575,8 @@ fn colorspace_object(ctx: &mut Context, cs: &ColorSpace) -> Result<PsObject, PsE
             let idx_id = ctx.names.intern(b"Indexed");
             let idx_name = PsObject::name_lit(idx_id);
 
-            let base_name_bytes = match base.as_ref() {
-                ColorSpace::DeviceGray => b"DeviceGray" as &[u8],
-                ColorSpace::DeviceRGB => b"DeviceRGB",
-                ColorSpace::DeviceCMYK => b"DeviceCMYK",
-                ColorSpace::Indexed { .. } => b"Indexed",
-                ColorSpace::CIEBasedABC { .. } => b"CIEBasedABC",
-                ColorSpace::CIEBasedA { .. } => b"CIEBasedA",
-                ColorSpace::CIEBasedDEF { .. } => b"CIEBasedDEF",
-                ColorSpace::CIEBasedDEFG { .. } => b"CIEBasedDEFG",
-                ColorSpace::ICCBased { .. } => b"ICCBased",
-                ColorSpace::Separation { .. } => b"Separation",
-                ColorSpace::DeviceN { .. } => b"DeviceN",
-                ColorSpace::Pattern { .. } => b"Pattern",
-            };
-            let base_id = ctx.names.intern(base_name_bytes);
-            let base_obj = PsObject::name_lit(base_id);
+            let base = base.as_ref().clone();
+            let base_obj = nested_space_object(ctx, &base)?;
 
             let hival_obj = PsObject::int(*hival as i32);
 
@@ -391,17 +622,46 @@ fn colorspace_object(ctx: &mut Context, cs: &ColorSpace) -> Result<PsObject, PsE
                 }
             }
         }
-        cs => {
-            let name_bytes = match cs {
-                ColorSpace::DeviceGray => b"DeviceGray" as &[u8],
-                ColorSpace::DeviceRGB => b"DeviceRGB",
-                ColorSpace::DeviceCMYK => b"DeviceCMYK",
-                ColorSpace::Separation { .. } => b"Separation",
-                ColorSpace::DeviceN { .. } => b"DeviceN",
-                _ => b"DeviceGray",
-            };
-            let name_id = ctx.names.intern(name_bytes);
-            let name_obj = PsObject::name_lit(name_id);
+        // `[/Separation name alternativeSpace tintTransform]`.
+        ColorSpace::Separation {
+            name,
+            alt_space,
+            tint_transform,
+            ..
+        } => {
+            let family = PsObject::name_lit(ctx.names.intern(b"Separation"));
+            let colorant = PsObject::name_lit(ctx.names.intern(name));
+            let tint_transform = *tint_transform;
+            let alt = alt_space.as_ref().clone();
+            let alt_obj = nested_space_object(ctx, &alt)?;
+            let items = [family, colorant, alt_obj, tint_transform];
+            let entity = crate::vm_ops::alloc_array_from(ctx, &items);
+            crate::vm_ops::make_array_obj(ctx, entity, 4)
+        }
+        // `[/DeviceN names alternativeSpace tintTransform]`.
+        ColorSpace::DeviceN {
+            names,
+            alt_space,
+            tint_transform,
+            ..
+        } => {
+            let family = PsObject::name_lit(ctx.names.intern(b"DeviceN"));
+            let colorants: Vec<PsObject> = names
+                .iter()
+                .map(|n| PsObject::name_lit(ctx.names.intern(n)))
+                .collect();
+            let names_entity = crate::vm_ops::alloc_array_from(ctx, &colorants);
+            let names_obj =
+                crate::vm_ops::make_array_obj(ctx, names_entity, colorants.len() as u32);
+            let tint_transform = *tint_transform;
+            let alt = alt_space.as_ref().clone();
+            let alt_obj = nested_space_object(ctx, &alt)?;
+            let items = [family, names_obj, alt_obj, tint_transform];
+            let entity = crate::vm_ops::alloc_array_from(ctx, &items);
+            crate::vm_ops::make_array_obj(ctx, entity, 4)
+        }
+        ColorSpace::DeviceGray | ColorSpace::DeviceRGB | ColorSpace::DeviceCMYK => {
+            let name_obj = nested_space_object(ctx, cs)?;
             let entity = crate::vm_ops::alloc_array_from(ctx, &[name_obj]);
             crate::vm_ops::make_array_obj(ctx, entity, 1)
         }
@@ -420,29 +680,47 @@ fn cie_space_object(ctx: &mut Context, name: &[u8], dict_entity: EntityId) -> Ps
 
 /// `setcolor`: comp1 ... compn → — (set color using current color space)
 pub fn op_setcolor(ctx: &mut Context) -> Result<(), PsError> {
+    if let Some(device) = remapped_device_space(ctx) {
+        return set_remapped_device_color(ctx, &device);
+    }
+    set_color_in_space(ctx)
+}
+
+/// Set the colour in `gstate.color_space` from the operand stack, without
+/// regard to UseCIEColor: the remapped device spaces call it to paint
+/// through their `Default*` space.
+fn set_color_in_space(ctx: &mut Context) -> Result<(), PsError> {
     // Clear tint values and ICC components by default; the Separation,
-    // DeviceN and ICCBased arms re-set them.
+    // DeviceN and ICCBased arms re-set them. Each arm sets the components
+    // `currentcolor` reports once its operands are popped, so a `setcolor`
+    // that fails leaves them describing the colour still current. The device
+    // arms set the colour alone: the space is already the one wanted, and
+    // `setgray` and its kin would replace the array `setcolorspace` kept.
     ctx.gstate.tint_values = None;
     ctx.gstate.icc_components = None;
     match ctx.gstate.color_space.clone() {
-        ColorSpace::DeviceGray => op_setgray(ctx),
-        ColorSpace::DeviceRGB => op_setrgbcolor(ctx),
-        ColorSpace::DeviceCMYK => op_setcmykcolor(ctx),
+        ColorSpace::DeviceGray => set_gray_components(ctx).map(drop),
+        ColorSpace::DeviceRGB => set_rgb_components(ctx).map(drop),
+        ColorSpace::DeviceCMYK => set_cmyk_components(ctx).map(drop),
         ColorSpace::Indexed { .. } => set_indexed_color(ctx),
         ColorSpace::CIEBasedABC { params, .. } => set_cie_abc_color(ctx, &params),
         ColorSpace::CIEBasedA { params, .. } => set_cie_a_color(ctx, &params),
         ColorSpace::CIEBasedDEF { params, .. } => set_cie_def_color(ctx, &params),
         ColorSpace::CIEBasedDEFG { params, .. } => set_cie_defg_color(ctx, &params),
         ColorSpace::ICCBased {
-            n, profile_hash, ..
+            n,
+            profile_hash,
+            dict_entity,
         } => {
             if let Some(hash) = profile_hash {
-                set_icc_color(ctx, n, &hash)
+                set_icc_color(ctx, n, &hash, dict_entity)
             } else {
-                // No embedded ICC profile — use PLRM formulas, not system ICC profile
+                // No embedded ICC profile — use PLRM formulas, not system ICC
+                // profile. The space stays ICCBased, so `setgray` and
+                // `setrgbcolor` themselves would be wrong here.
                 match n {
-                    1 => op_setgray(ctx),
-                    3 => op_setrgbcolor(ctx),
+                    1 => set_gray_components(ctx).map(drop),
+                    3 => set_rgb_components(ctx).map(drop),
                     4 => {
                         // Use from_cmyk (PLRM formula) directly, not op_setcmykcolor
                         // which would apply the system CMYK ICC profile
@@ -463,6 +741,7 @@ pub fn op_setcolor(ctx: &mut Context) -> Result<(), PsError> {
                             y.clamp(0.0, 1.0),
                             k.clamp(0.0, 1.0),
                         );
+                        ctx.gstate.color_components = None;
                         clear_pattern_color(ctx);
                         Ok(())
                     }
@@ -483,6 +762,7 @@ pub fn op_setcolor(ctx: &mut Context) -> Result<(), PsError> {
             ctx.o_stack.pop()?;
             let tint_clamped = tint.clamp(0.0, 1.0);
             ctx.gstate.tint_values = Some(vec![tint_clamped]);
+            ctx.gstate.color_components = Some(Arc::from([tint_clamped]));
             let process_cmyk = separation_process_cmyk(&name, tint_clamped);
             // A process colorant is its own ink whatever the alternate space
             // says, so it keeps CMYK numbers even behind a Gray/RGB
@@ -515,6 +795,7 @@ pub fn op_setcolor(ctx: &mut Context) -> Result<(), PsError> {
                 tints.push(v.clamp(0.0, 1.0));
             }
             ctx.gstate.tint_values = Some(tints.clone());
+            ctx.gstate.color_components = Some(Arc::from(tints.as_slice()));
             let colorants = ProcessColorants {
                 process_cmyk: devicen_process_cmyk(&names, &tints),
                 native_fallback: None,
@@ -589,134 +870,60 @@ fn set_color_from_tint_result(
 
 /// `currentcolor`: — → comp1 ... compn (color in current color space)
 ///
-/// For Indexed color spaces, returns the resolved base-space components.
+/// The components as `setcolor` took them, in the current space — the index
+/// of an Indexed colour, the tints of a Separation or DeviceN one, the inputs
+/// of a CIE-based one — not the colour they were converted to. In a device
+/// space, and an ICCBased one read without a profile, the colour holds them
+/// exactly; the same is true of a device space UseCIEColor remapped, whose
+/// default CIE space takes the device components unchanged.
 pub fn op_currentcolor(ctx: &mut Context) -> Result<(), PsError> {
-    match &ctx.gstate.color_space {
-        ColorSpace::DeviceGray => {
-            let gray = ctx.gstate.color.to_gray();
-            ctx.o_stack.push(PsObject::real(gray))?;
+    // The pattern is part of the current color, so it comes back with any
+    // base-space components an uncolored pattern was given (PLRM 4.9.6).
+    // Before the first `setcolor` the color is the null pattern.
+    if let ColorSpace::Pattern { .. } = ctx.gstate.color_space {
+        let comps = ctx.gstate.pattern_components.clone();
+        let dict = ctx.gstate.current_pattern_dict;
+        for c in comps {
+            ctx.o_stack.push(PsObject::real(c))?;
         }
-        ColorSpace::Indexed { base, .. } => {
-            // Return resolved components in the base color space
-            match base.as_ref() {
-                ColorSpace::DeviceGray => {
-                    let gray = ctx.gstate.color.to_gray();
-                    ctx.o_stack.push(PsObject::real(gray))?;
-                }
-                ColorSpace::DeviceRGB => {
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.r))?;
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.g))?;
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.b))?;
-                }
-                ColorSpace::DeviceCMYK => {
-                    let (c, m, y, k) = ctx.gstate.color.to_cmyk();
-                    ctx.o_stack.push(PsObject::real(c))?;
-                    ctx.o_stack.push(PsObject::real(m))?;
-                    ctx.o_stack.push(PsObject::real(y))?;
-                    ctx.o_stack.push(PsObject::real(k))?;
-                }
-                _ => {
-                    let gray = ctx.gstate.color.to_gray();
-                    ctx.o_stack.push(PsObject::real(gray))?;
-                }
+        match dict {
+            Some(entity) => {
+                let obj = crate::vm_ops::make_dict_obj(ctx, entity);
+                ctx.o_stack.push(obj)?;
             }
+            None => ctx.o_stack.push(PsObject::null())?,
         }
-        ColorSpace::CIEBasedA { .. } => {
-            // CIEBasedA has 1 component
-            ctx.o_stack.push(PsObject::real(ctx.gstate.color.r))?;
+        return Ok(());
+    }
+    if let Some(comps) = ctx.gstate.color_components.clone() {
+        // An index is an integer, and Ghostscript returns it as one.
+        let indexed = matches!(ctx.gstate.color_space, ColorSpace::Indexed { .. });
+        for &c in comps.iter() {
+            ctx.o_stack.push(if indexed {
+                PsObject::int(c as i64)
+            } else {
+                PsObject::real(c)
+            })?;
         }
-        ColorSpace::CIEBasedABC { .. } | ColorSpace::CIEBasedDEF { .. } => {
-            // CIEBasedABC/DEF have 3 components
+        return Ok(());
+    }
+    match color_space_components(&ctx.gstate.color_space) {
+        1 => ctx
+            .o_stack
+            .push(PsObject::real(ctx.gstate.color.to_gray()))?,
+        3 => {
             ctx.o_stack.push(PsObject::real(ctx.gstate.color.r))?;
             ctx.o_stack.push(PsObject::real(ctx.gstate.color.g))?;
             ctx.o_stack.push(PsObject::real(ctx.gstate.color.b))?;
         }
-        ColorSpace::CIEBasedDEFG { .. } => {
-            // CIEBasedDEFG has 4 components
+        4 => {
             let (c, m, y, k) = ctx.gstate.color.to_cmyk();
             ctx.o_stack.push(PsObject::real(c))?;
             ctx.o_stack.push(PsObject::real(m))?;
             ctx.o_stack.push(PsObject::real(y))?;
             ctx.o_stack.push(PsObject::real(k))?;
         }
-        ColorSpace::ICCBased { n, .. } => {
-            // ICCBased falls back to device space behavior
-            match n {
-                1 => {
-                    let gray = ctx.gstate.color.to_gray();
-                    ctx.o_stack.push(PsObject::real(gray))?;
-                }
-                3 => {
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.r))?;
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.g))?;
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.b))?;
-                }
-                4 => {
-                    let (c, m, y, k) = ctx.gstate.color.to_cmyk();
-                    ctx.o_stack.push(PsObject::real(c))?;
-                    ctx.o_stack.push(PsObject::real(m))?;
-                    ctx.o_stack.push(PsObject::real(y))?;
-                    ctx.o_stack.push(PsObject::real(k))?;
-                }
-                _ => {}
-            }
-        }
-        ColorSpace::DeviceRGB => {
-            ctx.o_stack.push(PsObject::real(ctx.gstate.color.r))?;
-            ctx.o_stack.push(PsObject::real(ctx.gstate.color.g))?;
-            ctx.o_stack.push(PsObject::real(ctx.gstate.color.b))?;
-        }
-        ColorSpace::DeviceCMYK => {
-            let (c, m, y, k) = ctx.gstate.color.to_cmyk();
-            ctx.o_stack.push(PsObject::real(c))?;
-            ctx.o_stack.push(PsObject::real(m))?;
-            ctx.o_stack.push(PsObject::real(y))?;
-            ctx.o_stack.push(PsObject::real(k))?;
-        }
-        ColorSpace::Separation {
-            num_alt_components, ..
-        }
-        | ColorSpace::DeviceN {
-            num_alt_components, ..
-        } => {
-            // Color is already in alternative space
-            match num_alt_components {
-                1 => {
-                    ctx.o_stack
-                        .push(PsObject::real(ctx.gstate.color.to_gray()))?;
-                }
-                4 => {
-                    let (c, m, y, k) = ctx.gstate.color.to_cmyk();
-                    ctx.o_stack.push(PsObject::real(c))?;
-                    ctx.o_stack.push(PsObject::real(m))?;
-                    ctx.o_stack.push(PsObject::real(y))?;
-                    ctx.o_stack.push(PsObject::real(k))?;
-                }
-                _ => {
-                    // 3-component (RGB) or default
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.r))?;
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.g))?;
-                    ctx.o_stack.push(PsObject::real(ctx.gstate.color.b))?;
-                }
-            }
-        }
-        // The pattern is part of the current color, so it comes back with any
-        // base-space components an uncolored pattern was given (PLRM 4.9.6).
-        // Before the first `setcolor` the color is the null pattern.
-        ColorSpace::Pattern { .. } => {
-            let comps = ctx.gstate.pattern_components.clone();
-            let dict = ctx.gstate.current_pattern_dict;
-            for c in comps {
-                ctx.o_stack.push(PsObject::real(c))?;
-            }
-            match dict {
-                Some(entity) => {
-                    let obj = crate::vm_ops::make_dict_obj(ctx, entity);
-                    ctx.o_stack.push(obj)?;
-                }
-                None => ctx.o_stack.push(PsObject::null())?,
-            }
-        }
+        _ => {}
     }
     Ok(())
 }
@@ -724,7 +931,12 @@ pub fn op_currentcolor(ctx: &mut Context) -> Result<(), PsError> {
 /// Set color from ICCBased color space with an actual ICC profile.
 /// Pops N components, converts through ICC profile, stores as DeviceColor,
 /// and keeps the components for [`reconvert_color_for_intent`].
-fn set_icc_color(ctx: &mut Context, n: u32, hash: &[u8; 32]) -> Result<(), PsError> {
+fn set_icc_color(
+    ctx: &mut Context,
+    n: u32,
+    hash: &[u8; 32],
+    dict_entity: EntityId,
+) -> Result<(), PsError> {
     if (ctx.o_stack.len() as u32) < n {
         return Err(PsError::StackUnderflow);
     }
@@ -746,35 +958,53 @@ fn set_icc_color(ctx: &mut Context, n: u32, hash: &[u8; 32]) -> Result<(), PsErr
             _ => 0.0,
         };
     }
-    // Convert through ICC
-    let intent = gstate_intent(ctx);
-    if let Some((r, g, b)) = ctx
-        .icc_cache
-        .convert_color_with_intent(hash, &comps, intent)
-    {
-        ctx.gstate.color = DeviceColor::from_rgb(r, g, b);
-    } else {
-        // Fallback to device-based conversion
-        ctx.gstate.color = match n {
-            1 => DeviceColor::from_gray(comps[0].clamp(0.0, 1.0)),
-            3 => DeviceColor::from_rgb(
-                comps[0].clamp(0.0, 1.0),
-                comps[1].clamp(0.0, 1.0),
-                comps[2].clamp(0.0, 1.0),
-            ),
-            4 => DeviceColor::from_cmyk_icc_with_intent(
-                comps[0].clamp(0.0, 1.0),
-                comps[1].clamp(0.0, 1.0),
-                comps[2].clamp(0.0, 1.0),
-                comps[3].clamp(0.0, 1.0),
-                intent,
-                &mut ctx.icc_cache,
-            ),
-            _ => DeviceColor::black(),
-        };
-    }
+    // Each component is clipped to the space's /Range, as Ghostscript does,
+    // before it is converted and before `currentcolor` reports it.
+    let comps = clamp_to_ranges(&comps, &icc_range(ctx, dict_entity, n)).to_vec();
+    ctx.gstate.color = icc_device_color(ctx, n, hash, &comps);
+    ctx.gstate.color_components = Some(Arc::from(comps.as_slice()));
     ctx.gstate.icc_components = Some(comps);
     Ok(())
+}
+
+/// An ICCBased space's `/Range`: a `[min max]` pair for each of its `n`
+/// components, `[0 1]` for each when the dictionary gives none or gives one
+/// of the wrong length.
+fn icc_range(ctx: &Context, dict_entity: EntityId, n: u32) -> Vec<f64> {
+    let default: Vec<f64> = (0..n).flat_map(|_| [0.0, 1.0]).collect();
+    let range = get_cie_float_array(ctx, dict_entity, b"Range", &default);
+    if range.len() == default.len() {
+        range
+    } else {
+        default
+    }
+}
+
+/// Convert components in an ICCBased space with a profile to the device
+/// colour, through the profile, or through the device space with as many
+/// components when the profile cannot convert them.
+fn icc_device_color(ctx: &mut Context, n: u32, hash: &[u8; 32], comps: &[f64]) -> DeviceColor {
+    let intent = gstate_intent(ctx);
+    if let Some((r, g, b)) = ctx.icc_cache.convert_color_with_intent(hash, comps, intent) {
+        return DeviceColor::from_rgb(r, g, b);
+    }
+    match n {
+        1 => DeviceColor::from_gray(comps[0].clamp(0.0, 1.0)),
+        3 => DeviceColor::from_rgb(
+            comps[0].clamp(0.0, 1.0),
+            comps[1].clamp(0.0, 1.0),
+            comps[2].clamp(0.0, 1.0),
+        ),
+        4 => DeviceColor::from_cmyk_icc_with_intent(
+            comps[0].clamp(0.0, 1.0),
+            comps[1].clamp(0.0, 1.0),
+            comps[2].clamp(0.0, 1.0),
+            comps[3].clamp(0.0, 1.0),
+            intent,
+            &mut ctx.icc_cache,
+        ),
+        _ => DeviceColor::black(),
+    }
 }
 
 /// Set color in an Indexed color space: index → —
@@ -842,6 +1072,7 @@ fn set_indexed_color(ctx: &mut Context) -> Result<(), PsError> {
 
     ctx.o_stack.pop()?;
     ctx.gstate.color = color;
+    ctx.gstate.color_components = Some(Arc::from([index as f64]));
     clear_pattern_color(ctx);
     Ok(())
 }
@@ -866,37 +1097,36 @@ fn default_color_for_space(cs: &ColorSpace, ctx: &mut Context) -> DeviceColor {
             DeviceColor::from_cie_defg(0.0, 0.0, 0.0, 0.0, params)
         }
         ColorSpace::ICCBased {
-            n, profile_hash, ..
+            n,
+            profile_hash,
+            dict_entity,
         } => {
-            let default_comps: &[f64] = match n {
-                1 => &[0.0],
-                3 => &[0.0, 0.0, 0.0],
-                4 => &[0.0, 0.0, 0.0, 1.0],
-                _ => return DeviceColor::black(),
+            let Some(hash) = profile_hash else {
+                // Without a profile it can use, the space stands for the
+                // device space with as many components, which is what
+                // Ghostscript substitutes, and starts at that space's
+                // initial colour: black.
+                return match n {
+                    1 => DeviceColor::from_gray(0.0),
+                    3 => DeviceColor::from_rgb(0.0, 0.0, 0.0),
+                    4 => DeviceColor::from_cmyk_icc_with_intent(
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        intent,
+                        &mut ctx.icc_cache,
+                    ),
+                    _ => DeviceColor::black(),
+                };
             };
-            if profile_hash.is_some() {
-                ctx.gstate.icc_components = Some(default_comps.to_vec());
-            }
-            if let Some(hash) = profile_hash
-                && let Some((r, g, b)) =
-                    ctx.icc_cache
-                        .convert_color_with_intent(hash, default_comps, intent)
-            {
-                return DeviceColor::from_rgb(r, g, b);
-            }
-            match n {
-                1 => DeviceColor::from_gray(0.0),
-                3 => DeviceColor::from_rgb(0.0, 0.0, 0.0),
-                4 => DeviceColor::from_cmyk_icc_with_intent(
-                    0.0,
-                    0.0,
-                    0.0,
-                    1.0,
-                    intent,
-                    &mut ctx.icc_cache,
-                ),
-                _ => DeviceColor::black(),
-            }
+            // Each component starts at 0, clipped to /Range (PLRM,
+            // `setcolorspace`) — for a CMYK profile no ink, white, not the
+            // `0 0 0 1` DeviceCMYK starts at.
+            let comps = clamp_to_ranges(&vec![0.0; *n as usize], &icc_range(ctx, *dict_entity, *n));
+            let color = icc_device_color(ctx, *n, hash, &comps);
+            ctx.gstate.icc_components = Some(comps.to_vec());
+            color
         }
         ColorSpace::Indexed { base, lookup, .. } => {
             // Default is index 0 resolved through the palette
@@ -928,9 +1158,9 @@ fn default_color_for_space(cs: &ColorSpace, ctx: &mut Context) -> DeviceColor {
                 DeviceColor::from_gray(0.0)
             }
         }
-        // Separation/DeviceN: default color requires tint transform execution,
-        // which needs the eval loop. Default to black; setcolor will run the
-        // tint transform via continuation to set the actual color.
+        // Separation/DeviceN: the initial colour is the tint transform's
+        // result at tint 1.0, which `install_initial_tints` sets once the
+        // space is current. Black stands in until then, and if it fails.
         ColorSpace::Separation { .. } | ColorSpace::DeviceN { .. } => DeviceColor::black(),
         // The initial color in a Pattern space is the null pattern, which paints
         // nothing; the device color only matters once a pattern is installed.
@@ -1033,6 +1263,25 @@ fn color_for_intent(
     })
 }
 
+/// The elements of an array or a packed array: entity, start and length.
+///
+/// A colour space array, and every array inside one, may be either: a program
+/// run with `true setpacking` builds packed arrays throughout, and Ghostscript
+/// accepts them anywhere a colour space takes an array.
+fn array_span(obj: &PsObject) -> Option<(EntityId, u32, u32)> {
+    match obj.value {
+        PsValue::Array { entity, start, len } | PsValue::PackedArray { entity, start, len } => {
+            Some((entity, start, len))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `obj` is a procedure: an executable array or packed array.
+fn is_procedure(obj: &PsObject) -> bool {
+    obj.is_array_type() && obj.flags.is_executable()
+}
+
 /// Resolve a color space from a PsObject (name or array).
 /// Returns the ColorSpace and its number of components.
 pub fn resolve_color_space_from_obj(
@@ -1050,7 +1299,7 @@ pub fn resolve_color_space_from_obj(
                 _ => Err(PsError::Undefined),
             }
         }
-        PsValue::Array { entity, start, len } => {
+        PsValue::Array { entity, start, len } | PsValue::PackedArray { entity, start, len } => {
             if len == 0 {
                 return Err(PsError::RangeCheck);
             }
@@ -1129,7 +1378,7 @@ fn parse_indexed_colorspace(
                 _ => return Err(PsError::RangeCheck),
             }
         }
-        PsValue::Array { .. } => {
+        PsValue::Array { .. } | PsValue::PackedArray { .. } => {
             let (cs, _) = resolve_color_space_from_obj(ctx, &base_obj)?;
             // An Indexed space may not be based on another Indexed space.
             if matches!(cs, ColorSpace::Indexed { .. }) {
@@ -1156,7 +1405,7 @@ fn parse_indexed_colorspace(
             start,
             len,
         } => (ctx.strings.get(se, start, len).to_vec(), None),
-        PsValue::ExecArray { .. } | PsValue::Array { .. } => {
+        PsValue::ExecArray { .. } | PsValue::Array { .. } | PsValue::PackedArray { .. } => {
             // Procedure lookup — will be pre-evaluated in resolve_indexed_proc_lookup
             (Vec::new(), Some(lookup_obj))
         }
@@ -1248,10 +1497,7 @@ fn lookup_default_colorspace(ctx: &mut Context, device_space: &[u8]) -> Option<C
     })?;
 
     // Parse the resource array as a color space
-    let (entity, start, len) = match resource_obj.value {
-        PsValue::Array { entity, start, len } => (entity, start, len),
-        _ => return None,
-    };
+    let (entity, start, len) = array_span(&resource_obj)?;
     if len == 0 {
         return None;
     }
@@ -1358,6 +1604,8 @@ fn parse_cie_def_colorspace(
     }
     let params = CieDefParams {
         range_def,
+        range_hij: [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        decode_def: None,
         m1: 0,
         m2: 0,
         m3: 0,
@@ -1402,6 +1650,8 @@ fn parse_cie_defg_colorspace(
     }
     let params = CieDefgParams {
         range_defg,
+        range_hijk: [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        decode_defg: None,
         m1: 0,
         m2: 0,
         m3: 0,
@@ -1539,12 +1789,8 @@ fn parse_devicen_colorspace(
 ) -> Result<ColorSpace, PsError> {
     // Element 1: array of colorant names
     let names_obj = ctx.arrays.get_element(entity, start + 1);
-    let (num_colorants, names) = match names_obj.value {
-        PsValue::Array {
-            entity: name_ent,
-            start: name_start,
-            len,
-        } => {
+    let (num_colorants, names) = match array_span(&names_obj) {
+        Some((name_ent, name_start, len)) => {
             let mut names = Vec::with_capacity(len as usize);
             for i in 0..len {
                 let elem = ctx.arrays.get_element(name_ent, name_start + i);
@@ -1586,7 +1832,7 @@ fn parse_alt_space_name(ctx: &mut Context, obj: &PsObject) -> Result<(ColorSpace
         // PLRM 4.9.4/4.9.5: the alternate space may be any device or CIE-based
         // space, which `pdftops` writes in array form — e.g. a spot colour over
         // `[/CIEBasedABC <<...>>]`. It may not itself be a special space.
-        PsValue::Array { .. } => {
+        PsValue::Array { .. } | PsValue::PackedArray { .. } => {
             let (cs, n) = resolve_color_space_from_obj(ctx, obj)?;
             if matches!(
                 cs,
@@ -1616,7 +1862,7 @@ fn get_cie_float_array(
     let dk = DictKey::Name(name_id);
     match ctx.dicts.get(dict_entity, &dk) {
         Some(obj) => match obj.value {
-            PsValue::Array { entity, start, len } => {
+            PsValue::Array { entity, start, len } | PsValue::PackedArray { entity, start, len } => {
                 let mut result = Vec::with_capacity(len as usize);
                 for i in 0..len {
                     let elem = ctx.arrays.get_element(entity, start + i);
@@ -1710,6 +1956,7 @@ fn set_cie_abc_color(ctx: &mut Context, params: &Arc<CieAbcParams>) -> Result<()
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     ctx.gstate.color = DeviceColor::from_cie_abc(a, b, c, params);
+    ctx.gstate.color_components = Some(clamp_to_ranges(&[a, b, c], &params.range_abc));
     clear_pattern_color(ctx);
     Ok(())
 }
@@ -1724,6 +1971,7 @@ fn set_cie_a_color(ctx: &mut Context, params: &Arc<CieAParams>) -> Result<(), Ps
 
     ctx.o_stack.pop()?;
     ctx.gstate.color = DeviceColor::from_cie_a(a, params);
+    ctx.gstate.color_components = Some(clamp_to_ranges(&[a], &params.range_a));
     clear_pattern_color(ctx);
     Ok(())
 }
@@ -1744,6 +1992,7 @@ fn set_cie_def_color(ctx: &mut Context, params: &Arc<CieDefParams>) -> Result<()
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     ctx.gstate.color = DeviceColor::from_cie_def(d, e, f, params);
+    ctx.gstate.color_components = Some(clamp_to_ranges(&[d, e, f], &params.range_def));
     clear_pattern_color(ctx);
     Ok(())
 }
@@ -1767,8 +2016,23 @@ fn set_cie_defg_color(ctx: &mut Context, params: &Arc<CieDefgParams>) -> Result<
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     ctx.gstate.color = DeviceColor::from_cie_defg(d, e, f, g, params);
+    ctx.gstate.color_components = Some(clamp_to_ranges(&[d, e, f, g], &params.range_defg));
     clear_pattern_color(ctx);
     Ok(())
+}
+
+/// Clamp each of `values` to its `[min max]` pair in `ranges`, a CIE-based
+/// space's RangeA / RangeABC / RangeDEF / RangeDEFG: what `currentcolor`
+/// reports for the colour `setcolor` was given.
+///
+/// The ranges come from the program, so they are not trusted to be ordered;
+/// see [`clamp_to_range`](stet_graphics::color::clamp_to_range).
+fn clamp_to_ranges(values: &[f64], ranges: &[f64]) -> Arc<[f64]> {
+    values
+        .iter()
+        .zip(ranges.as_chunks::<2>().0)
+        .map(|(&v, &[a, b])| stet_graphics::color::clamp_to_range(v, a, b))
+        .collect()
 }
 
 /// Get the number of color components for a color space.
@@ -1988,24 +2252,20 @@ fn get_cie_decode_procs(
     let name_id = ctx.names.find(key)?;
     let dk = DictKey::Name(name_id);
     let obj = ctx.dicts.get(dict_entity, &dk)?;
-    match obj.value {
-        PsValue::Array { entity, start, len } => {
-            if (len as usize) < expected {
-                return None;
-            }
-            let mut procs = Vec::with_capacity(expected);
-            for i in 0..expected as u32 {
-                let elem = ctx.arrays.get_element(entity, start + i);
-                // Each element should be an executable array (procedure)
-                match elem.value {
-                    PsValue::Array { .. } if elem.flags.is_executable() => procs.push(elem),
-                    _ => return None,
-                }
-            }
-            Some(procs)
-        }
-        _ => None,
+    let (entity, start, len) = array_span(&obj)?;
+    if (len as usize) < expected {
+        return None;
     }
+    let mut procs = Vec::with_capacity(expected);
+    for i in 0..expected as u32 {
+        let elem = ctx.arrays.get_element(entity, start + i);
+        // Each element should be a procedure
+        if !is_procedure(&elem) {
+            return None;
+        }
+        procs.push(elem);
+    }
+    Some(procs)
 }
 
 /// Extract a single decode procedure from a CIE dict entry (for DecodeA).
@@ -2017,10 +2277,7 @@ fn get_cie_decode_proc_single(
     let name_id = ctx.names.find(key)?;
     let dk = DictKey::Name(name_id);
     let obj = ctx.dicts.get(dict_entity, &dk)?;
-    match obj.value {
-        PsValue::Array { .. } if obj.flags.is_executable() => Some(obj),
-        _ => None,
-    }
+    is_procedure(&obj).then_some(obj)
 }
 
 /// Upper bound on memoised decode tables. Each entry is one `Vec<f64>` of
@@ -2290,131 +2547,187 @@ fn eval_decode_table_range_uncached(
     Ok(table)
 }
 
-/// Pre-convert a CIEBasedDEF 3D lookup table to sRGB.
+/// Most entries a CIEBasedDEF or CIEBasedDEFG table may have.
+///
+/// The dimensions are the program's to choose, and arrays may alias — one
+/// inner array repeated down the outer one, one string down each inner one —
+/// so a few kilobytes of program can claim a table of any size; the strings
+/// alone do not bound it. Real tables are far smaller: `pdftops` writes 17⁴
+/// (83,521) entries for an ICC profile, and 33 points an axis, 33⁴ (1.19M),
+/// is as fine as colour-management tables go. 2²² (4.19M) entries is 100 MB
+/// of tables; past it, `limitcheck`, the PLRM's error for an implementation
+/// limit.
+const MAX_CIE_TABLE_ENTRIES: usize = 1 << 22;
+
+/// Read the `/Table` of a CIEBasedDEF (`n` = 3) or CIEBasedDEFG (`n` = 4)
+/// space: `[m1 … mn table]` (PLRM, "CIEBasedDEF and CIEBasedDEFG Color
+/// Spaces"). For DEF, `table` is m1 strings of 3·m2·m3 bytes; for DEFG it is
+/// m1 arrays, each of m2 strings of 3·m3·m4 bytes. Each entry's three bytes
+/// are A, B and C, scaled into `range_abc`. Returns the dimensions and the
+/// A, B and C tables, the last axis varying fastest.
+///
+/// Every dimension must be an integer greater than 1 and every array and
+/// string at least as long as the dimensions make it — `rangecheck`
+/// otherwise, `typecheck` for an element of the wrong type, as in
+/// Ghostscript. All of it is checked before the tables are allocated.
+fn read_cie_table(
+    ctx: &Context,
+    dict_entity: EntityId,
+    n: usize,
+    range_abc: &[f64; 6],
+) -> Result<(Vec<usize>, [Vec<f64>; 3]), PsError> {
+    let table_obj = get_dict_obj_by_key(ctx, dict_entity, b"Table").ok_or(PsError::Undefined)?;
+    let (entity, start, len) = array_span(&table_obj).ok_or(PsError::TypeCheck)?;
+    if (len as usize) < n + 1 {
+        return Err(PsError::RangeCheck);
+    }
+    let mut dims = Vec::with_capacity(n);
+    for i in 0..n {
+        // An integer, as the PLRM has it; a real with a whole value is taken
+        // for one, and any other real is a `rangecheck`, as in Ghostscript.
+        let m = match ctx.arrays.get_element(entity, start + i as u32).value {
+            PsValue::Int(m) => m as f64,
+            PsValue::Real(m) if m.fract() == 0.0 => m,
+            PsValue::Real(_) => return Err(PsError::RangeCheck),
+            _ => return Err(PsError::TypeCheck),
+        };
+        if !(2.0..=MAX_CIE_TABLE_ENTRIES as f64).contains(&m) {
+            return Err(if m < 2.0 {
+                PsError::RangeCheck
+            } else {
+                PsError::LimitCheck
+            });
+        }
+        dims.push(m as usize);
+    }
+    let total = dims
+        .iter()
+        .try_fold(1usize, |acc, &m| acc.checked_mul(m))
+        .filter(|&t| t <= MAX_CIE_TABLE_ENTRIES)
+        .ok_or(PsError::LimitCheck)?;
+    // Each string holds the entries of the last two axes, three bytes each.
+    let per_string = dims[n - 2] * dims[n - 1];
+
+    let string_at = |obj: PsObject| -> Result<(EntityId, u32), PsError> {
+        match obj.value {
+            PsValue::String { entity, start, len } if (len as usize) >= per_string * 3 => {
+                Ok((entity, start))
+            }
+            PsValue::String { .. } => Err(PsError::RangeCheck),
+            _ => Err(PsError::TypeCheck),
+        }
+    };
+    // The strings in table order, the leading axes slowest.
+    let outer = ctx.arrays.get_element(entity, start + n as u32);
+    let (outer_entity, outer_start, outer_len) = array_span(&outer).ok_or(PsError::TypeCheck)?;
+    if (outer_len as usize) < dims[0] {
+        return Err(PsError::RangeCheck);
+    }
+    let mut strings = Vec::with_capacity(total / per_string);
+    for h in 0..dims[0] {
+        let elem = ctx.arrays.get_element(outer_entity, outer_start + h as u32);
+        if n == 3 {
+            strings.push(string_at(elem)?);
+            continue;
+        }
+        let (inner_entity, inner_start, inner_len) = array_span(&elem).ok_or(PsError::TypeCheck)?;
+        if (inner_len as usize) < dims[1] {
+            return Err(PsError::RangeCheck);
+        }
+        for i in 0..dims[1] {
+            strings.push(string_at(
+                ctx.arrays.get_element(inner_entity, inner_start + i as u32),
+            )?);
+        }
+    }
+
+    let scale = |ch: usize, byte: u8| {
+        range_abc[2 * ch] + byte as f64 * (range_abc[2 * ch + 1] - range_abc[2 * ch]) / 255.0
+    };
+    let mut tables = [
+        Vec::with_capacity(total),
+        Vec::with_capacity(total),
+        Vec::with_capacity(total),
+    ];
+    for (str_entity, str_start) in strings {
+        let bytes = ctx
+            .strings
+            .get(str_entity, str_start, (per_string * 3) as u32);
+        for entry in bytes.as_chunks::<3>().0 {
+            for (ch, table) in tables.iter_mut().enumerate() {
+                table.push(scale(ch, entry[ch]));
+            }
+        }
+    }
+    Ok((dims, tables))
+}
+
+/// A CIE range array from the dictionary — `[min max]` per component, `N`
+/// numbers — or `[0 1]` for each component when it is absent or short.
+fn cie_range<const N: usize>(ctx: &Context, dict_entity: EntityId, key: &[u8]) -> [f64; N] {
+    let mut range = [0.0; N];
+    for pair in range.as_chunks_mut::<2>().0 {
+        pair[1] = 1.0;
+    }
+    let found = get_cie_float_array(ctx, dict_entity, key, &range);
+    if found.len() >= N {
+        range.copy_from_slice(&found[..N]);
+    }
+    range
+}
+
+/// Sample the `N` decode procedures under `key` over their input ranges —
+/// `range` gives a `[min max]` pair for each — as the ABC and LMN decode
+/// tables are sampled. `None` when the dictionary has none.
+fn sample_decode_procs<const N: usize>(
+    ctx: &mut Context,
+    dict_entity: EntityId,
+    key: &[u8],
+    range: &[f64],
+) -> Result<Option<[Vec<f64>; N]>, PsError> {
+    let Some(procs) = get_cie_decode_procs(ctx, dict_entity, key, N) else {
+        return Ok(None);
+    };
+    let mut tables: [Vec<f64>; N] = std::array::from_fn(|_| Vec::new());
+    for (ch, proc) in procs.iter().enumerate() {
+        tables[ch] = eval_decode_table_range(ctx, *proc, 256, range[2 * ch], range[2 * ch + 1])?;
+    }
+    Ok(Some(tables))
+}
+
+/// The ABC stage of a CIEBasedDEF or CIEBasedDEFG space, which its table
+/// feeds, with its DecodeABC and DecodeLMN procedures sampled.
+fn table_space_abc_params(
+    ctx: &mut Context,
+    dict_entity: EntityId,
+) -> Result<CieAbcParams, PsError> {
+    let mut abc_params = extract_cie_abc_params(ctx, dict_entity);
+    let range_abc = abc_params.range_abc;
+    abc_params.decode_abc = sample_decode_procs::<3>(ctx, dict_entity, b"DecodeABC", &range_abc)?;
+    let range_lmn = abc_params.range_lmn;
+    abc_params.decode_lmn = sample_decode_procs::<3>(ctx, dict_entity, b"DecodeLMN", &range_lmn)?;
+    Ok(abc_params)
+}
+
+/// Read a CIEBasedDEF space's table and decode stages: DEF → DecodeDEF →
+/// HIJ (RangeHIJ) → the 3D table → ABC.
 fn precompute_cie_def_table(
     ctx: &mut Context,
     dict_entity: EntityId,
 ) -> Result<CieDefParams, PsError> {
-    // Extract RangeDEF
-    let range_def_vec = get_cie_float_array(
-        ctx,
-        dict_entity,
-        b"RangeDEF",
-        &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-    );
-    let mut range_def = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
-    if range_def_vec.len() >= 6 {
-        range_def.copy_from_slice(&range_def_vec[..6]);
-    }
-
-    // Extract Table: [m1 m2 m3 [string1 ... string_m1]]
-    let table_obj = get_dict_obj_by_key(ctx, dict_entity, b"Table");
-    let (m1, m2, m3, strings_entity, strings_start) = match table_obj {
-        Some(obj) => match obj.value {
-            PsValue::Array { entity, start, len } if len >= 4 => {
-                let m1 = ctx.arrays.get_element(entity, start).as_i32().unwrap_or(0) as usize;
-                let m2 = ctx
-                    .arrays
-                    .get_element(entity, start + 1)
-                    .as_i32()
-                    .unwrap_or(0) as usize;
-                let m3 = ctx
-                    .arrays
-                    .get_element(entity, start + 2)
-                    .as_i32()
-                    .unwrap_or(0) as usize;
-                let strings_obj = ctx.arrays.get_element(entity, start + 3);
-                match strings_obj.value {
-                    PsValue::Array {
-                        entity: se,
-                        start: ss,
-                        ..
-                    } => (m1, m2, m3, se, ss),
-                    _ => return Err(PsError::TypeCheck),
-                }
-            }
-            _ => return Err(PsError::TypeCheck),
-        },
-        None => return Err(PsError::Undefined),
-    };
-
-    if m1 == 0 || m2 == 0 || m3 == 0 {
-        return Err(PsError::RangeCheck);
-    }
-
-    // Build CIE ABC params for conversion (with decode tables)
-    let abc_params = extract_cie_abc_params(ctx, dict_entity);
-    // Pre-evaluate DecodeABC and DecodeLMN over their respective ranges
-    let mut abc_params = abc_params;
-    if let Some(procs) = get_cie_decode_procs(ctx, dict_entity, b"DecodeABC", 3) {
-        let mut tables: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for (ch, proc) in procs.iter().enumerate() {
-            let lo = abc_params.range_abc[ch * 2];
-            let hi = abc_params.range_abc[ch * 2 + 1];
-            tables[ch] = eval_decode_table_range(ctx, *proc, 256, lo, hi)?;
-        }
-        abc_params.decode_abc = Some(tables);
-    }
-    if let Some(procs) = get_cie_decode_procs(ctx, dict_entity, b"DecodeLMN", 3) {
-        let mut tables: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for (ch, proc) in procs.iter().enumerate() {
-            let lo = abc_params.range_lmn[ch * 2];
-            let hi = abc_params.range_lmn[ch * 2 + 1];
-            tables[ch] = eval_decode_table_range(ctx, *proc, 256, lo, hi)?;
-        }
-        abc_params.decode_lmn = Some(tables);
-    }
-
-    // Extract RangeABC for byte scaling
-    let abc_min = [
-        abc_params.range_abc[0],
-        abc_params.range_abc[2],
-        abc_params.range_abc[4],
-    ];
-    let abc_scale = [
-        (abc_params.range_abc[1] - abc_params.range_abc[0]) / 255.0,
-        (abc_params.range_abc[3] - abc_params.range_abc[2]) / 255.0,
-        (abc_params.range_abc[5] - abc_params.range_abc[4]) / 255.0,
-    ];
-
-    // Extract table ABC values (interpolation done in ABC space, not RGB)
-    let total = m1 * m2 * m3;
-    let mut a_table = vec![0.0f64; total];
-    let mut b_table = vec![0.0f64; total];
-    let mut c_table = vec![0.0f64; total];
-
-    let mut idx = 0;
-    for di in 0..m1 {
-        let string_obj = ctx
-            .arrays
-            .get_element(strings_entity, strings_start + di as u32);
-        let data = match string_obj.value {
-            PsValue::String {
-                entity: se,
-                start: ss,
-                len: sl,
-            } => ctx.strings.get(se, ss, sl).to_vec(),
-            _ => continue,
-        };
-
-        for ei in 0..m2 {
-            for fi in 0..m3 {
-                let offset = (ei * m3 + fi) * 3;
-                if offset + 2 < data.len() {
-                    a_table[idx] = abc_min[0] + data[offset] as f64 * abc_scale[0];
-                    b_table[idx] = abc_min[1] + data[offset + 1] as f64 * abc_scale[1];
-                    c_table[idx] = abc_min[2] + data[offset + 2] as f64 * abc_scale[2];
-                }
-                idx += 1;
-            }
-        }
-    }
-
+    let range_def = cie_range::<6>(ctx, dict_entity, b"RangeDEF");
+    let range_hij = cie_range::<6>(ctx, dict_entity, b"RangeHIJ");
+    let abc_params = table_space_abc_params(ctx, dict_entity)?;
+    let (dims, [a_table, b_table, c_table]) =
+        read_cie_table(ctx, dict_entity, 3, &abc_params.range_abc)?;
+    let decode_def = sample_decode_procs::<3>(ctx, dict_entity, b"DecodeDEF", &range_def)?;
     Ok(CieDefParams {
         range_def,
-        m1,
-        m2,
-        m3,
+        range_hij,
+        decode_def,
+        m1: dims[0],
+        m2: dims[1],
+        m3: dims[2],
         a_table,
         b_table,
         c_table,
@@ -2422,136 +2735,26 @@ fn precompute_cie_def_table(
     })
 }
 
-/// Pre-convert a CIEBasedDEFG 4D lookup table to sRGB.
+/// Read a CIEBasedDEFG space's table and decode stages: DEFG → DecodeDEFG →
+/// HIJK (RangeHIJK) → the 4D table → ABC.
 fn precompute_cie_defg_table(
     ctx: &mut Context,
     dict_entity: EntityId,
 ) -> Result<CieDefgParams, PsError> {
-    // Extract RangeDEFG
-    let range_defg_vec = get_cie_float_array(
-        ctx,
-        dict_entity,
-        b"RangeDEFG",
-        &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-    );
-    let mut range_defg = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
-    if range_defg_vec.len() >= 8 {
-        range_defg.copy_from_slice(&range_defg_vec[..8]);
-    }
-
-    // Extract Table: [m1 m2 m3 m4 [string1 ... string_m1]]
-    let table_obj = get_dict_obj_by_key(ctx, dict_entity, b"Table");
-    let (m1, m2, m3, m4, strings_entity, strings_start) = match table_obj {
-        Some(obj) => match obj.value {
-            PsValue::Array { entity, start, len } if len >= 5 => {
-                let m1 = ctx.arrays.get_element(entity, start).as_i32().unwrap_or(0) as usize;
-                let m2 = ctx
-                    .arrays
-                    .get_element(entity, start + 1)
-                    .as_i32()
-                    .unwrap_or(0) as usize;
-                let m3 = ctx
-                    .arrays
-                    .get_element(entity, start + 2)
-                    .as_i32()
-                    .unwrap_or(0) as usize;
-                let m4 = ctx
-                    .arrays
-                    .get_element(entity, start + 3)
-                    .as_i32()
-                    .unwrap_or(0) as usize;
-                let strings_obj = ctx.arrays.get_element(entity, start + 4);
-                match strings_obj.value {
-                    PsValue::Array {
-                        entity: se,
-                        start: ss,
-                        ..
-                    } => (m1, m2, m3, m4, se, ss),
-                    _ => return Err(PsError::TypeCheck),
-                }
-            }
-            _ => return Err(PsError::TypeCheck),
-        },
-        None => return Err(PsError::Undefined),
-    };
-
-    if m1 == 0 || m2 == 0 || m3 == 0 || m4 == 0 {
-        return Err(PsError::RangeCheck);
-    }
-
-    // Build CIE ABC params for conversion (with decode tables)
-    let mut abc_params = extract_cie_abc_params(ctx, dict_entity);
-    if let Some(procs) = get_cie_decode_procs(ctx, dict_entity, b"DecodeABC", 3) {
-        let mut tables: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for (ch, proc) in procs.iter().enumerate() {
-            let lo = abc_params.range_abc[ch * 2];
-            let hi = abc_params.range_abc[ch * 2 + 1];
-            tables[ch] = eval_decode_table_range(ctx, *proc, 256, lo, hi)?;
-        }
-        abc_params.decode_abc = Some(tables);
-    }
-    if let Some(procs) = get_cie_decode_procs(ctx, dict_entity, b"DecodeLMN", 3) {
-        let mut tables: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-        for (ch, proc) in procs.iter().enumerate() {
-            let lo = abc_params.range_lmn[ch * 2];
-            let hi = abc_params.range_lmn[ch * 2 + 1];
-            tables[ch] = eval_decode_table_range(ctx, *proc, 256, lo, hi)?;
-        }
-        abc_params.decode_lmn = Some(tables);
-    }
-
-    let abc_min = [
-        abc_params.range_abc[0],
-        abc_params.range_abc[2],
-        abc_params.range_abc[4],
-    ];
-    let abc_scale = [
-        (abc_params.range_abc[1] - abc_params.range_abc[0]) / 255.0,
-        (abc_params.range_abc[3] - abc_params.range_abc[2]) / 255.0,
-        (abc_params.range_abc[5] - abc_params.range_abc[4]) / 255.0,
-    ];
-
-    // Extract table ABC values (conversion done at lookup time, not pre-converted)
-    let total = m1 * m2 * m3 * m4;
-    let mut a_table = vec![0.0f64; total];
-    let mut b_table = vec![0.0f64; total];
-    let mut c_table = vec![0.0f64; total];
-
-    let mut idx = 0;
-    for di in 0..m1 {
-        let string_obj = ctx
-            .arrays
-            .get_element(strings_entity, strings_start + di as u32);
-        let data = match string_obj.value {
-            PsValue::String {
-                entity: se,
-                start: ss,
-                len: sl,
-            } => ctx.strings.get(se, ss, sl).to_vec(),
-            _ => continue,
-        };
-
-        for ei in 0..m2 {
-            for fi in 0..m3 {
-                for gi in 0..m4 {
-                    let offset = (ei * m3 * m4 + fi * m4 + gi) * 3;
-                    if offset + 2 < data.len() {
-                        a_table[idx] = abc_min[0] + data[offset] as f64 * abc_scale[0];
-                        b_table[idx] = abc_min[1] + data[offset + 1] as f64 * abc_scale[1];
-                        c_table[idx] = abc_min[2] + data[offset + 2] as f64 * abc_scale[2];
-                    }
-                    idx += 1;
-                }
-            }
-        }
-    }
-
+    let range_defg = cie_range::<8>(ctx, dict_entity, b"RangeDEFG");
+    let range_hijk = cie_range::<8>(ctx, dict_entity, b"RangeHIJK");
+    let abc_params = table_space_abc_params(ctx, dict_entity)?;
+    let (dims, [a_table, b_table, c_table]) =
+        read_cie_table(ctx, dict_entity, 4, &abc_params.range_abc)?;
+    let decode_defg = sample_decode_procs::<4>(ctx, dict_entity, b"DecodeDEFG", &range_defg)?;
     Ok(CieDefgParams {
         range_defg,
-        m1,
-        m2,
-        m3,
-        m4,
+        range_hijk,
+        decode_defg,
+        m1: dims[0],
+        m2: dims[1],
+        m3: dims[2],
+        m4: dims[3],
         a_table,
         b_table,
         c_table,
@@ -2809,5 +3012,108 @@ mod tests {
         let mut ctx = setup();
         ctx.o_stack.push(PsObject::bool(true)).unwrap();
         assert_eq!(op_setgray(&mut ctx), Err(PsError::TypeCheck));
+    }
+
+    /// `[/Indexed /DeviceRGB 2 <ff0000 00ff00 0000ff>]`.
+    fn indexed_rgb_space(ctx: &mut Context) -> PsObject {
+        let lookup: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let str_entity = crate::vm_ops::alloc_string(ctx, lookup);
+        let lookup = crate::vm_ops::make_string_obj(ctx, str_entity, 9);
+        let items = [
+            PsObject::name_lit(ctx.names.intern(b"Indexed")),
+            PsObject::name_lit(ctx.names.intern(b"DeviceRGB")),
+            PsObject::int(2),
+            lookup,
+        ];
+        let entity = crate::vm_ops::alloc_array_from(ctx, &items);
+        crate::vm_ops::make_array_obj(ctx, entity, 4)
+    }
+
+    fn current_color(ctx: &mut Context) -> Vec<PsValue> {
+        let depth = ctx.o_stack.len();
+        op_currentcolor(ctx).unwrap();
+        let mut out: Vec<PsValue> = (depth..ctx.o_stack.len())
+            .map(|_| ctx.o_stack.pop().unwrap().value)
+            .collect();
+        out.reverse();
+        out
+    }
+
+    fn same_array(a: &PsObject, b: &PsObject) -> bool {
+        matches!(
+            (&a.value, &b.value),
+            (
+                PsValue::Array { entity: ea, start: sa, len: la },
+                PsValue::Array { entity: eb, start: sb, len: lb },
+            ) if ea == eb && sa == sb && la == lb
+        )
+    }
+
+    #[test]
+    fn test_indexed_currentcolor_is_the_index() {
+        let mut ctx = setup();
+        let space = indexed_rgb_space(&mut ctx);
+        ctx.o_stack.push(space).unwrap();
+        op_setcolorspace(&mut ctx).unwrap();
+        assert!(matches!(current_color(&mut ctx)[..], [PsValue::Int(0)]));
+
+        // Rounded and clipped to hival, and an integer however it was given.
+        ctx.o_stack.push(PsObject::real(1.6)).unwrap();
+        op_setcolor(&mut ctx).unwrap();
+        assert!(matches!(current_color(&mut ctx)[..], [PsValue::Int(2)]));
+        // The colour is still the one the index looks up.
+        assert!((ctx.gstate.color.b - 1.0).abs() < 1e-9);
+
+        // A setcolor that fails leaves the index that was current.
+        ctx.o_stack.push(PsObject::bool(true)).unwrap();
+        assert_eq!(op_setcolor(&mut ctx), Err(PsError::TypeCheck));
+        ctx.o_stack.pop().unwrap();
+        assert!(matches!(current_color(&mut ctx)[..], [PsValue::Int(2)]));
+    }
+
+    #[test]
+    fn test_currentcolorspace_returns_the_array_given() {
+        let mut ctx = setup();
+        let space = indexed_rgb_space(&mut ctx);
+        ctx.o_stack.push(space).unwrap();
+        op_setcolorspace(&mut ctx).unwrap();
+        ctx.o_stack.push(PsObject::int(1)).unwrap();
+        op_setcolor(&mut ctx).unwrap();
+        op_currentcolorspace(&mut ctx).unwrap();
+        assert!(same_array(&ctx.o_stack.pop().unwrap(), &space));
+
+        // A colour operator sets a space of its own.
+        ctx.o_stack.push(PsObject::real(0.5)).unwrap();
+        op_setgray(&mut ctx).unwrap();
+        assert!(ctx.gstate.color_space_object.is_none());
+        op_currentcolorspace(&mut ctx).unwrap();
+        assert!(!same_array(&ctx.o_stack.pop().unwrap(), &space));
+    }
+
+    #[test]
+    fn test_icc_range_defaults_to_unit_ranges() {
+        let mut ctx = setup();
+        let dict = crate::vm_ops::alloc_dict(&mut ctx, 4, b"icc");
+        assert_eq!(icc_range(&ctx, dict, 3), [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+
+        // A /Range of the wrong length is ignored rather than misread.
+        let short = [PsObject::real(0.2), PsObject::real(1.0)];
+        let entity = crate::vm_ops::alloc_array_from(&mut ctx, &short);
+        let short = crate::vm_ops::make_array_obj(&ctx, entity, 2);
+        let key = DictKey::Name(ctx.names.intern(b"Range"));
+        ctx.dicts.put(dict, key, short);
+        assert_eq!(icc_range(&ctx, dict, 3), [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(icc_range(&ctx, dict, 1), [0.2, 1.0]);
+    }
+
+    #[test]
+    fn test_clamp_to_ranges_takes_ranges_in_either_order() {
+        assert_eq!(
+            &*clamp_to_ranges(&[5.0, 5.0], &[0.0, 1.0, 1.0, 0.0]),
+            &[1.0, 1.0]
+        );
+        // A NaN bound must not panic, as `f64::clamp` would: `min` and `max`
+        // pass over it, so the other bound stands for both.
+        assert_eq!(&*clamp_to_ranges(&[0.5], &[f64::NAN, 1.0]), &[1.0]);
     }
 }

@@ -202,7 +202,13 @@ pub enum FileHandle {
     /// Decode/encode filter wrapping another file.
     Filter(Box<FilterState>),
     /// In-memory byte source (for string-backed data).
-    StringSource { data: Arc<[u8]>, pos: usize },
+    ///
+    /// The bytes are shared so the scanner can hold them while it allocates
+    /// through the `Context` that owns this store. An `Arc<Vec<u8>>` rather
+    /// than an `Arc<[u8]>`, because wrapping a `Vec` moves it where
+    /// converting one to `Arc<[u8]>` copies it, and a source can be a whole
+    /// job.
+    StringSource { data: Arc<Vec<u8>>, pos: usize },
     /// A procedure data source that has not been run yet (PLRM 3.8.4).
     ///
     /// This is a *transitional* state. The procedure has to be executed by the
@@ -429,7 +435,7 @@ impl FileStore {
             let id = EntityId(self.files.len() as u32);
             self.files.push(FileEntry {
                 handle: FileHandle::StringSource {
-                    data: Arc::from(data),
+                    data: Arc::new(data.to_vec()),
                     pos: 0,
                 },
                 name: name.to_string(),
@@ -557,7 +563,7 @@ impl FileStore {
         let id = EntityId(self.files.len() as u32);
         self.files.push(FileEntry {
             handle: FileHandle::StringSource {
-                data: data.into(),
+                data: Arc::new(data),
                 pos: 0,
             },
             name: "%stringsource".to_string(),
@@ -683,7 +689,7 @@ impl FileStore {
             "install_proc_data on a handle that is not a pending procedure source"
         );
         entry.handle = FileHandle::StringSource {
-            data: data.into(),
+            data: Arc::new(data),
             pos: 0,
         };
         self.pending_procs = self.pending_procs.saturating_sub(1);
@@ -715,7 +721,7 @@ impl FileStore {
 
     /// A StringSource file's bytes, shared, and its read position: what
     /// [`Self::get_remaining_bytes`] gives, without borrowing the store.
-    pub fn shared_remaining(&self, entity: EntityId) -> Option<(Arc<[u8]>, usize)> {
+    pub fn shared_remaining(&self, entity: EntityId) -> Option<(Arc<Vec<u8>>, usize)> {
         match &self.files.get(entity.raw_index())?.handle {
             FileHandle::StringSource { data, pos } => Some((Arc::clone(data), *pos)),
             _ => None,
@@ -1276,6 +1282,16 @@ impl FileStore {
                 let expected_len = w as usize * h as usize * nc as usize;
                 // Pad or truncate to expected size
                 buf.resize(expected_len, 0);
+                // `jpeg-encoder` stores CMYK inverted, as Adobe's encoders do,
+                // but a JPEG's samples are what `DCTDecode` returns as stored
+                // (`stet_graphics::jpeg::decode`), so the samples written must
+                // be the ones stored, as Ghostscript writes them. Inverting
+                // here cancels the encoder's inversion.
+                if color_type == jpeg_encoder::ColorType::Cmyk {
+                    for b in buf.iter_mut() {
+                        *b = 255 - *b;
+                    }
+                }
 
                 let mut jpeg_data = Vec::new();
                 let encoder = jpeg_encoder::Encoder::new(&mut jpeg_data, q);
@@ -1689,24 +1705,10 @@ impl FileStore {
                     if !jpeg_data.ends_with(&[0xFF, 0xD9]) {
                         jpeg_data.extend_from_slice(&[0xFF, 0xD9]);
                     }
-                    let mut decoder = jpeg_decoder::Decoder::new(jpeg_data.as_slice());
-                    let mut pixels = decoder
-                        .decode()
+                    // The PDF reader's decoder, so a JPEG gives the samples
+                    // it gives there: a CMYK one as stored, not inverted.
+                    let pixels = stet_graphics::jpeg::decode(&jpeg_data)
                         .map_err(|e| io::Error::other(format!("JPEG decode error: {e}")))?;
-                    // jpeg_decoder inverts four-component samples (255 - x),
-                    // taking them for Adobe's inverted CMYK. DCTDecode hands
-                    // on the samples as stored, as Ghostscript's does and as
-                    // the PDF reader's does: the program's Decode array says
-                    // how to read them. Illustrator's EPS images, written
-                    // with Decode [0 1 0 1 0 1 0 1], came out as negatives.
-                    if decoder
-                        .info()
-                        .is_some_and(|i| i.pixel_format == jpeg_decoder::PixelFormat::CMYK32)
-                    {
-                        for b in pixels.iter_mut() {
-                            *b = 255 - *b;
-                        }
-                    }
                     state.output_buf = pixels;
                     state.output_pos = 0;
                     *decoded = true;

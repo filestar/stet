@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 // stet - A PostScript Interpreter
 // Copyright (c) 2026 Scott Bowman
 // SPDX-License-Identifier: Apache-2.0 OR MIT
@@ -29,6 +28,8 @@
 //! [`stet-pdf-reader`](https://crates.io/crates/stet-pdf-reader) to parse
 //! PDFs into `DisplayList`s.
 
+#![forbid(unsafe_code)]
+
 pub mod color;
 pub mod device;
 pub mod display_list;
@@ -36,6 +37,7 @@ pub mod document_structure;
 pub mod icc;
 pub mod image_limits;
 pub mod image_samples;
+pub mod jpeg;
 pub mod layer_set;
 pub mod mesh_shading;
 pub mod rendering_intent;

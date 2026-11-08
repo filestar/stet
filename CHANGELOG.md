@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`stet_core::file_store::FileHandle::StringSource`'s `data` is an
+  `Arc<Vec<u8>>`**, so the scanner can hold a source's bytes while it
+  allocates (see Fixed); `FileStore::shared_remaining` hands out that
+  share. Code matching the variant reads the bytes through the `Arc`
+  unchanged. Contributed by @nielsbosma (#20).
+- **`stet-fonts`, `stet-graphics`, `stet-pdf-reader` and `stet` are
+  `#![forbid(unsafe_code)]`.** None contained any; the attribute keeps it
+  that way.
 - **`LICENSE-URW-FONTS` now cites URW++'s authorisation of the OFL for
   the embedded fonts, where it gave stet's reading of the grant.** The
   files are URW++'s 2017 revisions of its Version 2.0 set and a 2020
@@ -20,6 +28,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Twardoch's archive, which offers the same files byte for byte under
   all three licences. The READMEs, which stated the OFL licensing without
   its basis, now point to it. The fonts are unchanged.
+- **`stet_graphics::color::CieDefParams` and `CieDefgParams` have new
+  public fields:** `range_hij` and `decode_def`, and `range_hijk` and
+  `decode_defg` — the `/RangeHIJ(K)` and `/DecodeDEF(G)` stages of their
+  colour spaces (see Fixed). Code that builds either with a struct literal
+  needs the fields. Both become `#[non_exhaustive]` at the next breaking
+  release, as `GraphicsState` did in 0.9.0.
+- **JPEG decoding moved into `stet-graphics` as `stet_graphics::jpeg`**
+  (`decode`, `jpeg_dimensions`, `patch_jpeg_sof_height`), so the
+  PostScript `DCTDecode` filter and the PDF reader share it (see Fixed).
+  `stet_pdf_reader::filters::jpeg_dimensions` and `patch_jpeg_sof_height`
+  remain, re-exported. Decoding a JPEG on several threads is now the
+  `stet-graphics` feature `parallel`, which `stet-pdf-reader`'s `parallel`
+  turns on: a reader built without `parallel` no longer starts threads for
+  JPEGs, and `stet-core` no longer depends on `jpeg-decoder` itself.
+
+### Fixed
+
+- **Print drivers' Level 1 tray and duplex calls work.** A job calling
+  `0 statusdict /setpapertray get exec`, as Oracle Toolkit's output does,
+  stopped at `undefined`: statusdict had only `setjobtimeout` and
+  `lettertray`. It now has `setpapertray`, `setduplexmode` and `settumble`,
+  whose settings `papertray`, `duplexmode` and `tumble` read back, and
+  `manualfeed`. The tray selectors `lettertray`, `legaltray`, `11x17tray`,
+  `ledgertray`, `a3tray`, `a4tray`, `a5tray`, `b4tray` and `b5tray` set the
+  page size of their tray's paper, as Ghostscript's do; `lettertray`
+  previously did nothing. Contributed by @nielsbosma (#25).
+- **Executing a string no longer reads freed memory.** The scanner read
+  an executable string (`(...) cvx exec`) in place, in the byte store all
+  strings share, while scanning a token can allocate in that store and
+  move it. A procedure in such a string holding enough string literals
+  read the rest of itself from freed memory: a valid 2 MB file
+  segfaulted. The scanner now reads a copied window of the string.
+  Contributed by @nielsbosma (#20).
+- **A CMYK JPEG in PostScript decodes to the samples it stores.** The
+  `DCTDecode` filter returned them inverted, so an image `pdftops` wrote
+  from a CMYK JPEG came out as its negative — a white page black — where
+  the PDF reader and Ghostscript read it right. The filter now decodes
+  through the PDF reader's decoder, which also brings it that decoder's
+  handling of Adobe RGB and YCCK markers, 2-component JPEGs, heights given
+  in a DNL marker, and truncated streams. `DCTEncode` stored CMYK inverted
+  to match, so a CMYK JPEG it wrote read back inverted in Ghostscript; it
+  now stores the samples it is given.
+- **A colour space or function with a reversed range no longer crashes
+  the process.** A PostScript CIE-based colour space whose `/RangeABC`,
+  `/RangeLMN` or `/RangeA` runs high to low, a shading function's reversed
+  `/Domain` or `/Range`, and a PDF Lab colour space's reversed `/Range`
+  each panicked when a colour was converted, taking down any program
+  embedding the interpreter or the PDF reader. A reversed range is now
+  taken as the span it covers, through a new
+  `stet_graphics::color::clamp_to_range`, which clips to a range given in
+  either order.
+- **CIEBasedDEFG colour spaces paint the colours their table gives.** The
+  PLRM lays the table out as m1 arrays, each of m2 strings; stet read m1
+  strings, found arrays, and painted every colour in such a space the
+  same: black, or a deep blue for the Lab-based tables `pdftops` writes
+  for every CMYK ICC profile it converts to PostScript, where whole pages
+  came out blue. The table is now interpolated between its entries, as
+  Ghostscript does, rather than read at the nearest one.
+- **CIEBasedDEF and CIEBasedDEFG apply `/DecodeDEF(G)` and
+  `/RangeHIJ(K)`,** which stet ignored, so a space that set either was
+  looked up at the wrong place in its table.
+- **A CIEBasedDEF or CIEBasedDEFG table that does not match its
+  dimensions is an error,** as in Ghostscript: `rangecheck` for a
+  dimension below 2 or an array or string too short for it, `typecheck`
+  for an element of the wrong type. Before, a short table read past its
+  end, and a misshapen one was taken as all black. A table of more than
+  2²² entries is a `limitcheck`: arrays can alias, so a few kilobytes of
+  PostScript could claim a table of any size, and real ones stay below
+  1.2 million.
+- **Spot colours set with `setcustomcolor` are painted in their colour.**
+  It did nothing, so the shape took whatever colour was set before it,
+  usually black or white. Worse, Adobe's procsets define a working
+  `setcustomcolor` only when none exists, so stet's empty one also
+  displaced theirs: Illustrator EPS files lost every spot colour (a
+  PANTONE 185 C logo came out black). A CMYK custom colour now paints its
+  components scaled by the tint and an RGB one moves from white towards
+  its colour, as Adobe TN 5044 describes. The colour's name is not kept,
+  so the spot is painted as process colour. A tint outside 0 to 1 is
+  clamped and a `null` tint, which older Adobe procsets pass, does
+  nothing. Contributed by @nielsbosma (#19).
+- **A Separation or DeviceN colour space paints at full tint until
+  `setcolor` says otherwise.** The PLRM makes 1.0 the initial value of
+  every tint, so a fill straight after `setcolorspace` is the spot colour at
+  full strength; stet painted it black.
+- **`currentcolor` returns the colour as `setcolor` was given it, in the
+  current colour space.** In a Separation or DeviceN space it returned the
+  alternate-space colour the tints were converted to, in an Indexed space
+  the looked-up colour rather than the index, and in a CIE-based space the
+  converted colour rather than its inputs. It now returns the tints, the
+  index as an integer, and the CIE inputs clipped to the space's range, as
+  Ghostscript does, so a program that saves the colour with `currentcolor`
+  and puts it back with `setcolor` gets the same colour.
+- **`currentcolorspace` returns the array `setcolorspace` was given.** For
+  a Separation or DeviceN space it returned just `[/Separation]` or
+  `[/DeviceN]`, losing the colorant, alternate space and tint transform, so
+  the result could not be passed back to `setcolorspace`. A space nested in
+  an Indexed one came back as its family name alone. `setcolor` in an
+  ICCBased space without a profile also changed the space to DeviceGray or
+  DeviceRGB; it stays ICCBased.
+- **With `UseCIEColor` on, `setgray`, `setrgbcolor`, `setcmykcolor` and
+  `sethsbcolor` paint through the `DefaultGray`, `DefaultRGB` or
+  `DefaultCMYK` space.** They select their device space implicitly, so the
+  PLRM remaps them as it does `setcolorspace`, but stet set the device
+  colour directly and only `setcolor` was converted. `currentgray`,
+  `currentrgbcolor`, `currentcmykcolor` and `currenthsbcolor` report the
+  device colour the program set, not what the default space made of it,
+  and `setcolor` in a remapped device space clips as that device space
+  does, as in Ghostscript. A remapped DeviceCMYK starts at `0 0 0 1`
+  through `DefaultCMYK`, rather than at the default space's own initial
+  colour, no ink.
+- **An ICCBased colour space with a profile starts with every component
+  at 0, clipped to its `/Range`.** For a CMYK profile that is no ink, white;
+  stet started it at `0 0 0 1`, the initial colour of DeviceCMYK, and
+  painted black. `setcolor` in such a space also clips the components to
+  `/Range` before converting them, as Ghostscript does. A space whose
+  profile cannot be used stands for the device space, as in Ghostscript,
+  and still starts black.
+- **`setcolorspace` takes a packed array, and packed arrays anywhere inside
+  a colour space.** It raised `typecheck` for one, so a program run with
+  `true setpacking` could not set a colour space it built with
+  `packedarray`, and procedures written while packing was on — the decode
+  procedures of a CIE-based space — were ignored. `currentcolorspace` hands
+  the packed array back.
+- **`eq` and `ne` compare arrays, procedures and packed arrays by
+  identity, whatever their access.** Comparing an `executeonly` procedure
+  or a `noaccess` array raised `invalidaccess`, though only a string, whose
+  contents are compared, needs to be readable, as in Ghostscript. Two
+  separate packed arrays with the same contents compared equal; the PLRM
+  makes them unequal, as arrays are.
 
 ## [0.9.0] — 2026-10-28
 
