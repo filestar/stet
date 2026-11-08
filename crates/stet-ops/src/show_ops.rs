@@ -447,6 +447,27 @@ struct CmapTables {
 }
 
 impl CmapTables {
+    /// The tables of a CMap dictionary, read once and kept in
+    /// [`Context::cmap_tables`]: a CJK CMap holds thousands of ranges, and
+    /// reading them on every `show` cost about 0.7 ms a call (a character
+    /// table that shows each glyph on its own took a minute).
+    fn cached(ctx: &Context, cmap_entity: EntityId) -> Arc<Self> {
+        let hit = ctx
+            .cmap_tables
+            .lock()
+            .ok()
+            .and_then(|t| t.get(&cmap_entity).cloned())
+            .and_then(|any| any.downcast::<Self>().ok());
+        if let Some(tables) = hit {
+            return tables;
+        }
+        let tables = Arc::new(Self::read(ctx, cmap_entity));
+        if let Ok(mut t) = ctx.cmap_tables.lock() {
+            t.insert(cmap_entity, tables.clone());
+        }
+        tables
+    }
+
     /// Read a CMap dictionary, then the CMap it names with `usecmap`: its own
     /// entries come first and so win over the parent's.
     fn read(ctx: &Context, cmap_entity: EntityId) -> Self {
@@ -596,7 +617,7 @@ fn decode_cmap_codes(
     bytes: &[u8],
 ) -> Option<(Vec<CmapCode>, usize)> {
     let (cmap_entity, font_num) = font_cmap(ctx, font_entity)?;
-    let tables = CmapTables::read(ctx, cmap_entity);
+    let tables = CmapTables::cached(ctx, cmap_entity);
     if tables.codespace.is_empty() {
         return None;
     }
@@ -2178,8 +2199,29 @@ fn read_font_matrix(ctx: &Context, dict_entity: EntityId) -> Matrix {
     }
 }
 
+/// The font file of a Type 42 font or Type 2 CIDFont: its `sfnts` strings
+/// joined, once per `sfnts` array ([`Context::sfnts_cache`], which a
+/// `restore` drops with the array).
+fn concatenate_sfnts_array(ctx: &mut Context, dict_entity: EntityId) -> Option<Arc<Vec<u8>>> {
+    let sfnts_name = ctx.names.find(b"sfnts")?;
+    let key = match ctx
+        .dicts
+        .get(dict_entity, &DictKey::Name(sfnts_name))?
+        .value
+    {
+        PsValue::Array { entity, start, len } => (entity, start, len),
+        _ => return None,
+    };
+    if let Some(data) = ctx.sfnts_cache.get(&key) {
+        return Some(Arc::clone(data));
+    }
+    let data = Arc::new(join_sfnts_array(ctx, dict_entity)?);
+    ctx.sfnts_cache.insert(key, Arc::clone(&data));
+    Some(data)
+}
+
 /// Concatenate the sfnts array from a Type 42 / CIDFont dictionary into raw font data.
-fn concatenate_sfnts_array(ctx: &Context, dict_entity: EntityId) -> Option<Vec<u8>> {
+fn join_sfnts_array(ctx: &Context, dict_entity: EntityId) -> Option<Vec<u8>> {
     let sfnts_name = ctx.names.find(b"sfnts")?;
     let sfnts_obj = ctx.dicts.get(dict_entity, &DictKey::Name(sfnts_name))?;
     let (arr_entity, arr_start, arr_len) = match sfnts_obj.value {
@@ -2537,7 +2579,9 @@ fn render_show_composite(
                     text_record::Glyph {
                         font: font_entity,
                         glyph_space: combined_fm,
-                        metrics: text_record::truetype_metrics(font_data.as_deref()),
+                        metrics: text_record::truetype_metrics(
+                            font_data.as_deref().map(Vec::as_slice),
+                        ),
                         code: byte as u32,
                         text: match shown_name {
                             Some(id) => text_record::GlyphText::Name(id),
@@ -2621,7 +2665,7 @@ fn render_composite_truetype_cids(
     cid_metrics: &CidMetrics,
 ) -> Result<(), PsError> {
     let tt = TrueTypeCid::of(ctx, cidfont_entity);
-    let font_data = tt.font_data.as_deref();
+    let font_data = tt.font_data.as_deref().map(Vec::as_slice);
     let upm = tt.upm;
 
     let em_scale = Matrix::scale(1.0 / upm, 1.0 / upm);
@@ -2998,7 +3042,7 @@ fn font_wmode(ctx: &Context, font_entity: EntityId) -> i32 {
 /// used to access GlyphDirectory is obtained from the CIDMap table" (PLRM
 /// Table 5.17). Outlines and advances are in font units.
 struct TrueTypeCid {
-    font_data: Option<Vec<u8>>,
+    font_data: Option<Arc<Vec<u8>>>,
     glyph_dir: Option<EntityId>,
     cid_map: crate::cid_ops::CidToGid,
     /// The font's units per em.
@@ -3007,7 +3051,7 @@ struct TrueTypeCid {
 
 impl TrueTypeCid {
     /// Resolve the font's glyph data once per show operation.
-    fn of(ctx: &Context, cidfont: EntityId) -> Self {
+    fn of(ctx: &mut Context, cidfont: EntityId) -> Self {
         let font_data = concatenate_sfnts_array(ctx, cidfont);
         let upm = font_data
             .as_ref()
@@ -5280,7 +5324,7 @@ fn render_show_displaced_composite(
                             descent: -upm / 2.0,
                         }
                     } else {
-                        text_record::truetype_metrics(tt.font_data.as_deref())
+                        text_record::truetype_metrics(tt.font_data.as_deref().map(Vec::as_slice))
                     };
                     record_cid_glyph(
                         ctx,
@@ -5412,7 +5456,9 @@ fn render_show_displaced_composite(
                             text_record::Glyph {
                                 font: font_entity,
                                 glyph_space: combined_fm,
-                                metrics: text_record::truetype_metrics(font_data.as_deref()),
+                                metrics: text_record::truetype_metrics(
+                                    font_data.as_deref().map(Vec::as_slice),
+                                ),
                                 code: byte as u32,
                                 text: text_record::GlyphText::Name(glyph_name_id),
                                 origin: (cur_x, cur_y),

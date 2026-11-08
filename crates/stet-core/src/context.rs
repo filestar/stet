@@ -349,6 +349,20 @@ pub struct Context {
 
     // Glyph path cache: per-font charstring interpretation results
     pub glyph_caches: rustc_hash::FxHashMap<EntityId, crate::glyph_cache::GlyphCache>,
+    /// Type 42 and Type 2 CIDFont font files: each `sfnts` array (entity,
+    /// start, length) joined once, not once per `show`. Keyed by the array,
+    /// not the font, because `scalefont` and `makefont` copy the font
+    /// dictionary but share the array: a 4 MB CJK font shown a glyph at a
+    /// time otherwise copied 4 MB per glyph.
+    pub sfnts_cache: rustc_hash::FxHashMap<(EntityId, u32, u32), std::sync::Arc<Vec<u8>>>,
+    /// Each CMap dictionary's codespace and mappings, read once rather than
+    /// on every `show`, `stringwidth` or `charpath` (a CJK CMap holds
+    /// thousands of ranges). Keyed by the CMap dictionary; the tables are
+    /// the show operators' own type, hence `Any`. Behind a lock because the
+    /// decoders only borrow the context.
+    pub cmap_tables: std::sync::Mutex<
+        rustc_hash::FxHashMap<EntityId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    >,
     /// The metrics show operators gave CIDFont glyphs through the font's
     /// `Metrics2` or `CDevProc` (PLRM 5.9.2), by CIDFont and CID. An output
     /// device that writes the font rather than its outlines — PDF output —
@@ -1400,6 +1414,8 @@ impl Context {
             char_bbox: None,
             char_width_mode1: None,
             glyph_caches: rustc_hash::FxHashMap::default(),
+            sfnts_cache: rustc_hash::FxHashMap::default(),
+            cmap_tables: std::sync::Mutex::default(),
             cid_glyph_metrics: rustc_hash::FxHashMap::default(),
             font_snapshots: crate::font_snapshot::FontSnapshots::default(),
             char_cache_mode: None,
@@ -1810,6 +1826,12 @@ impl Context {
         let live_dict = |e: &EntityId| e.is_global() || e.raw_index() < dict_mark;
         self.glyph_caches.retain(|entity, _| live_dict(entity));
         self.form_cache.retain(|entity, _| live_dict(entity));
+        if let Ok(tables) = self.cmap_tables.get_mut() {
+            tables.retain(|entity, _| live_dict(entity));
+        }
+        let array_mark = marks.array_entities;
+        self.sfnts_cache
+            .retain(|(e, _, _), _| e.is_global() || e.raw_index() < array_mark);
         self.cid_glyph_metrics
             .retain(|(cidfont, _), _| live_dict(cidfont));
 

@@ -437,7 +437,8 @@ fn check_ref(
 /// - the operand, execution, and dictionary stacks
 /// - the well-known dictionary handles cached on [`Context`]
 /// - the graphics state, the gstate stack, and `gstate_store`
-/// - the entity-keyed caches (`glyph_caches`, `form_cache`)
+/// - the entity-keyed caches (`glyph_caches`, `sfnts_cache`, `cmap_tables`,
+///   `form_cache`)
 ///
 /// The display list and `PatternData` need no coverage: they live in
 /// `stet-graphics`, which does not depend on `stet-core`, so they cannot name
@@ -584,6 +585,29 @@ pub fn audit_dangling_refs(ctx: &Context) -> Vec<DanglingRef> {
             ctx,
             &PsObject::dict(*entity),
             "glyph cache",
+            "key".to_string(),
+            &mut out,
+        );
+    }
+    let cmaps: Vec<EntityId> = ctx
+        .cmap_tables
+        .lock()
+        .map(|t| t.keys().copied().collect())
+        .unwrap_or_default();
+    for entity in cmaps {
+        check_ref(
+            ctx,
+            &PsObject::dict(entity),
+            "CMap tables",
+            "key".to_string(),
+            &mut out,
+        );
+    }
+    for (entity, _, len) in ctx.sfnts_cache.keys() {
+        check_ref(
+            ctx,
+            &PsObject::array(*entity, *len),
+            "sfnts cache",
             "key".to_string(),
             &mut out,
         );
