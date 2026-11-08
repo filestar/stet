@@ -730,7 +730,9 @@ impl InterpreterBuilder {
     /// [`ImageParams::jpeg`](stet_graphics::device::ImageParams::jpeg). For a
     /// consumer that writes JPEG out as it is, such as an SVG or PDF writer;
     /// a page with hundreds of photographs then never holds them decoded.
-    /// Rasterising such a list decodes them when drawn. Off by default.
+    /// Before rasterising such a list, decode them with
+    /// [`DisplayList::decode_kept_jpeg`](stet_graphics::display_list::DisplayList::decode_kept_jpeg).
+    /// Off by default.
     pub fn keep_jpeg_data(mut self) -> Self {
         self.keep_jpeg = true;
         self
