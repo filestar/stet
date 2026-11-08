@@ -176,6 +176,7 @@ pub struct InterpreterBuilder {
     text_extraction: TextExtraction,
     default_rendering_intent: RenderingIntent,
     max_page_size_points: f64,
+    keep_jpeg: bool,
     #[cfg(feature = "render")]
     page_background: PageBackground,
 }
@@ -198,6 +199,7 @@ impl Interpreter {
             text_extraction: TextExtraction::Off,
             default_rendering_intent: RenderingIntent::RelativeColorimetric,
             max_page_size_points: stet_core::context::DEFAULT_MAX_PAGE_SIZE_POINTS,
+            keep_jpeg: false,
             #[cfg(feature = "render")]
             page_background: PageBackground::White,
         }
@@ -723,6 +725,17 @@ impl InterpreterBuilder {
         self
     }
 
+    /// Keep JPEG images in display lists as their JPEG data, not their
+    /// samples, where that draws the same: see
+    /// [`ImageParams::jpeg`](stet_graphics::device::ImageParams::jpeg). For a
+    /// consumer that writes JPEG out as it is, such as an SVG or PDF writer;
+    /// a page with hundreds of photographs then never holds them decoded.
+    /// Rasterising such a list decodes them when drawn. Off by default.
+    pub fn keep_jpeg_data(mut self) -> Self {
+        self.keep_jpeg = true;
+        self
+    }
+
     /// Allow pages up to `points` a side (default 14400, 200 inches).
     ///
     /// A file that declares a larger `PageSize` or EPS bounding box is
@@ -742,6 +755,7 @@ impl InterpreterBuilder {
         ctx.text_extraction = self.text_extraction;
         ctx.set_default_rendering_intent(self.default_rendering_intent);
         ctx.max_page_size_points = self.max_page_size_points;
+        ctx.keep_jpeg = self.keep_jpeg;
         Interpreter {
             ctx,
             #[cfg(feature = "render")]
