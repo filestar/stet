@@ -1690,9 +1690,23 @@ impl FileStore {
                         jpeg_data.extend_from_slice(&[0xFF, 0xD9]);
                     }
                     let mut decoder = jpeg_decoder::Decoder::new(jpeg_data.as_slice());
-                    let pixels = decoder
+                    let mut pixels = decoder
                         .decode()
                         .map_err(|e| io::Error::other(format!("JPEG decode error: {e}")))?;
+                    // jpeg_decoder inverts four-component samples (255 - x),
+                    // taking them for Adobe's inverted CMYK. DCTDecode hands
+                    // on the samples as stored, as Ghostscript's does and as
+                    // the PDF reader's does: the program's Decode array says
+                    // how to read them. Illustrator's EPS images, written
+                    // with Decode [0 1 0 1 0 1 0 1], came out as negatives.
+                    if decoder
+                        .info()
+                        .is_some_and(|i| i.pixel_format == jpeg_decoder::PixelFormat::CMYK32)
+                    {
+                        for b in pixels.iter_mut() {
+                            *b = 255 - *b;
+                        }
+                    }
                     state.output_buf = pixels;
                     state.output_pos = 0;
                     *decoded = true;
