@@ -120,6 +120,9 @@ pub struct FontTracker {
     /// Each copied instance a `Text` element names
     /// ([`TextParams::font_snapshot`]), as told apart.
     snapshot_ids: HashMap<u32, FontId>,
+    /// Embed the Standard 14 fonts too, as any other font, rather than
+    /// naming them for the viewer to supply.
+    embed_standard_14: bool,
 }
 
 impl FontTracker {
@@ -129,7 +132,15 @@ impl FontTracker {
             by_key: HashMap::new(),
             instance_to_font: HashMap::new(),
             snapshot_ids: HashMap::new(),
+            embed_standard_14: false,
         }
+    }
+
+    /// Embed the Standard 14 fonts as any other font (PDF/A and print
+    /// production require every font embedded; Ghostscript embeds them by
+    /// default). Off by default: they are named for the viewer to supply.
+    pub fn set_embed_standard_14(&mut self, on: bool) {
+        self.embed_standard_14 = on;
     }
 
     /// The instance a `Text` element's font is: its copy, once tracked,
@@ -223,9 +234,16 @@ impl FontTracker {
             }
             None => {
                 let idx = self.fonts.len();
+                // A font without a name (a font dictionary with no
+                // /FontName) still needs one in the PDF.
+                let font_name = if params.font_name.is_empty() {
+                    format!("Font{idx}").into_bytes()
+                } else {
+                    params.font_name.clone()
+                };
                 self.fonts.push(FontUsage {
                     pdf_name: format!("F{idx}"),
-                    font_name: params.font_name.clone(),
+                    font_name,
                     font_type: params.font_type,
                     font: id,
                     root: copy.map(|c| c.root.clone()),
@@ -235,7 +253,8 @@ impl FontTracker {
                     wmode: wmode.unwrap_or(0),
                     wmode_known: wmode.is_some(),
                     used_codes: HashSet::new(),
-                    is_standard_14: STANDARD_14.contains(&params.font_name.as_slice()),
+                    is_standard_14: !self.embed_standard_14
+                        && STANDARD_14.contains(&params.font_name.as_slice()),
                     sample_params: params.clone(),
                     widths: HashMap::new(),
                 });

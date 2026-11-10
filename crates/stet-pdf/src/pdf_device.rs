@@ -71,6 +71,8 @@ pub struct PdfDevice {
     /// The document is taken as bytes (`take_pdf_bytes*`), never written to
     /// a file: see [`Self::in_memory`].
     in_memory: bool,
+    /// Embed the Standard 14 fonts too: see [`Self::set_embed_standard_14`].
+    embed_standard_14: bool,
 }
 
 impl PdfDevice {
@@ -89,6 +91,7 @@ impl PdfDevice {
             output_intents: Vec::new(),
             emit_page_box_clip: true,
             in_memory: false,
+            embed_standard_14: false,
         }
     }
 
@@ -110,6 +113,15 @@ impl PdfDevice {
             in_memory: true,
             ..Self::new(width, height, dpi)
         }
+    }
+
+    /// Embed the Standard 14 fonts (Times, Helvetica, Courier, Symbol,
+    /// ZapfDingbats) from the interpreter's copies, as every other font, in
+    /// place of naming them for the viewer to supply. PDF/A and print
+    /// production require every font embedded, and Ghostscript's pdfwrite
+    /// embeds them by default. Default `false`.
+    pub fn set_embed_standard_14(&mut self, on: bool) {
+        self.embed_standard_14 = on;
     }
 
     /// Control whether to emit the implicit `0 0 W H re W n` page-box clip
@@ -331,6 +343,7 @@ impl PdfDevice {
 
         // Document-level font tracker — shared across all pages
         let mut font_tracker = FontTracker::new();
+        font_tracker.set_embed_standard_14(self.embed_standard_14);
 
         // Track every page's fonts first — the text in its groups, soft
         // masks, layers and pattern tiles too — so each resource's widths
@@ -1255,6 +1268,10 @@ impl PdfDevice {
             entries.push((b"Mask".to_vec(), PdfObj::Array(mask_ints)));
         }
 
+        if let Some(jpeg) = &img.jpeg {
+            entries.push((b"Filter".to_vec(), PdfObj::name("DCTDecode")));
+            return writer.add_stream(entries, jpeg, false);
+        }
         writer.add_stream(entries, &img.sample_data, true)
     }
 }

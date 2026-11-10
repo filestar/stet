@@ -40,6 +40,10 @@ pub struct ImageXObject {
     pub color_key_mask: Option<Vec<u8>>,
     /// ICC profile data to embed (if ICCBased color space).
     pub icc_profile: Option<IccProfileData>,
+    /// The image's JPEG data, written as it is (`/DCTDecode`) in place of
+    /// `sample_data`: an image the interpreter kept as JPEG
+    /// ([`ImageParams::jpeg`]).
+    pub jpeg: Option<Arc<Vec<u8>>>,
 }
 
 /// PDF color space representation.
@@ -96,6 +100,36 @@ pub struct IccProfileData {
 
 /// Convert raw sample data from a display list image to a PDF-ready XObject.
 pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
+    // Kept as JPEG: only an 8-bit DeviceGray or DeviceRGB image with the
+    // default Decode, whose JPEG decodes to exactly its samples.
+    if sample_data.is_empty()
+        && let Some(jpeg) = &params.jpeg
+    {
+        let pdf_color_space = match params.color_space {
+            ImageColorSpace::DeviceGray => Some(PdfColorSpace::DeviceGray),
+            ImageColorSpace::DeviceRGB => Some(PdfColorSpace::DeviceRGB),
+            _ => None,
+        };
+        if let Some(pdf_color_space) = pdf_color_space {
+            return ImageXObject {
+                sample_data: Vec::new(),
+                smask_data: None,
+                width: params.width,
+                height: params.height,
+                pdf_color_space,
+                bits_per_component: 8,
+                is_imagemask: false,
+                mask_color: None,
+                mask_spot_color: None,
+                color_key_mask: params.mask_color.clone(),
+                icc_profile: None,
+                jpeg: Some(jpeg.clone()),
+            };
+        }
+        if let Ok(px) = stet_graphics::jpeg::decode(jpeg) {
+            return convert_image(&px, &ImageParams { jpeg: None, ..params.clone() });
+        }
+    }
     match &params.color_space {
         ImageColorSpace::Mask {
             color,
@@ -115,6 +149,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
             mask_spot_color: None,
             color_key_mask: params.mask_color.clone(),
             icc_profile: None,
+            jpeg: None,
         },
         ImageColorSpace::DeviceRGB => ImageXObject {
             sample_data: sample_data.to_vec(),
@@ -128,6 +163,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
             mask_spot_color: None,
             color_key_mask: params.mask_color.clone(),
             icc_profile: None,
+            jpeg: None,
         },
         ImageColorSpace::DeviceCMYK => ImageXObject {
             sample_data: sample_data.to_vec(),
@@ -141,6 +177,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
             mask_spot_color: None,
             color_key_mask: params.mask_color.clone(),
             icc_profile: None,
+            jpeg: None,
         },
         ImageColorSpace::ICCBased {
             n, profile_data, ..
@@ -159,6 +196,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
                 data: (**profile_data).clone(),
                 n: *n,
             }),
+            jpeg: None,
         },
         ImageColorSpace::Indexed {
             base,
@@ -219,6 +257,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
                 mask_spot_color: None,
                 color_key_mask: params.mask_color.clone(),
                 icc_profile,
+                jpeg: None,
             }
         }
         ImageColorSpace::Separation {
@@ -243,6 +282,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
                 mask_spot_color: None,
                 color_key_mask: params.mask_color.clone(),
                 icc_profile: None,
+                jpeg: None,
             }
         }
         ImageColorSpace::DeviceN {
@@ -267,6 +307,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
                 mask_spot_color: None,
                 color_key_mask: params.mask_color.clone(),
                 icc_profile: None,
+                jpeg: None,
             }
         }
         // CIE-based spaces: convert through CIE pipeline to sRGB
@@ -295,6 +336,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
                 mask_spot_color: None,
                 color_key_mask: params.mask_color.clone(),
                 icc_profile: None,
+                jpeg: None,
             }
         }
         ImageColorSpace::CIEBasedA { params: cie_params } => {
@@ -319,6 +361,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
                 mask_spot_color: None,
                 color_key_mask: params.mask_color.clone(),
                 icc_profile: None,
+                jpeg: None,
             }
         }
         ImageColorSpace::Lab { range, .. } => {
@@ -350,6 +393,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
                 mask_spot_color: None,
                 color_key_mask: params.mask_color.clone(),
                 icc_profile: None,
+                jpeg: None,
             }
         }
         _ => ImageXObject {
@@ -364,6 +408,7 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
             mask_spot_color: None,
             color_key_mask: params.mask_color.clone(),
             icc_profile: None,
+            jpeg: None,
         },
     }
 }
@@ -400,6 +445,7 @@ fn convert_imagemask(
         mask_spot_color: spot_color.cloned(),
         color_key_mask: None,
         icc_profile: None,
+        jpeg: None,
     }
 }
 
@@ -444,5 +490,6 @@ fn convert_preconverted_rgba(rgba: &[u8], params: &ImageParams) -> ImageXObject 
         mask_spot_color: None,
         color_key_mask: None,
         icc_profile: None,
+        jpeg: None,
     }
 }

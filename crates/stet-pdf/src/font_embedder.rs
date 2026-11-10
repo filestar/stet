@@ -1037,6 +1037,40 @@ fn type42_widths(
     widths
 }
 
+/// A subset font's PDF name: six upper-case letters, `+`, the font's name.
+/// The tag is the same for the same font and glyphs, so output is
+/// reproducible; a name that already carries a tag keeps it.
+fn subset_name(name: &[u8], resource: &str, codes: &HashSet<u16>) -> Vec<u8> {
+    let tagged = name.len() > 7
+        && name[6] == b'+'
+        && name[..6].iter().all(|c| c.is_ascii_uppercase());
+    if tagged {
+        return name.to_vec();
+    }
+    // FNV-1a over the name, the resource and the codes, in order.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    name.iter().for_each(|&b| eat(b));
+    resource.bytes().for_each(&mut eat);
+    let mut sorted: Vec<u16> = codes.iter().copied().collect();
+    sorted.sort_unstable();
+    for c in sorted {
+        eat((c >> 8) as u8);
+        eat(c as u8);
+    }
+    let mut out = Vec::with_capacity(name.len() + 7);
+    for _ in 0..6 {
+        out.push(b'A' + (h % 26) as u8);
+        h /= 26;
+    }
+    out.push(b'+');
+    out.extend_from_slice(name);
+    out
+}
+
 /// Build a Type 1 font resource.
 fn build_type1_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData) -> Option<u32> {
     let font = usage.root.as_deref()?;
@@ -1110,11 +1144,17 @@ fn build_type1_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData)
         None
     };
 
-    // Build FontDescriptor
+    // Build FontDescriptor. An embedded program holds only the glyphs used,
+    // so its name carries a subset tag (ISO 32000-1 §9.6.4).
+    let base_font = if font_file_ref.is_some() {
+        subset_name(&usage.font_name, &usage.pdf_name, &usage.used_codes)
+    } else {
+        usage.font_name.clone()
+    };
     let bbox = get_font_bbox(fonts, font);
     let flags = compute_font_flags(font);
     let descriptor_ref =
-        build_font_descriptor(writer, &usage.font_name, &bbox, flags, font_file_ref, None);
+        build_font_descriptor(writer, &base_font, &bbox, flags, font_file_ref, None);
 
     // Build Encoding with Differences array merged from all font instances
     let encoding_obj =
@@ -1124,7 +1164,7 @@ fn build_type1_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData)
     let mut font_entries: Vec<(Vec<u8>, PdfObj)> = vec![
         (b"Type".to_vec(), PdfObj::name("Font")),
         (b"Subtype".to_vec(), PdfObj::name("Type1")),
-        (b"BaseFont".to_vec(), PdfObj::Name(usage.font_name.clone())),
+        (b"BaseFont".to_vec(), PdfObj::Name(base_font.clone())),
         (b"FirstChar".to_vec(), PdfObj::Int(first_char as i64)),
         (b"LastChar".to_vec(), PdfObj::Int(last_char as i64)),
         (b"Widths".to_vec(), PdfObj::Array(widths_array)),

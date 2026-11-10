@@ -164,6 +164,7 @@ pub struct Interpreter {
     keep_partial: bool,
     last_error: Option<StetError>,
     default_page: (f64, f64),
+    embed_standard_fonts: bool,
 }
 
 /// How long the `showpage` that ends a job cut short by an error may take.
@@ -179,6 +180,7 @@ pub struct InterpreterBuilder {
     max_page_size_points: f64,
     keep_jpeg: bool,
     default_page: (f64, f64),
+    embed_standard_fonts: bool,
     #[cfg(feature = "render")]
     page_background: PageBackground,
 }
@@ -203,6 +205,7 @@ impl Interpreter {
             max_page_size_points: stet_core::context::DEFAULT_MAX_PAGE_SIZE_POINTS,
             keep_jpeg: false,
             default_page: (612.0, 792.0),
+            embed_standard_fonts: false,
             #[cfg(feature = "render")]
             page_background: PageBackground::White,
         }
@@ -317,8 +320,11 @@ impl Interpreter {
 
         // Set up PdfDevice as the device factory
         let dpi_val = dpi;
+        let embed_standard_14 = self.embed_standard_fonts;
         self.ctx.device_factory = Some(Box::new(move |w, h| {
-            Box::new(stet_pdf::PdfDevice::in_memory(w, h, dpi_val)) as Box<dyn OutputDevice>
+            let mut dev = stet_pdf::PdfDevice::in_memory(w, h, dpi_val);
+            dev.set_embed_standard_14(embed_standard_14);
+            Box::new(dev) as Box<dyn OutputDevice>
         }));
 
         // Routes showpage to the device; the in-memory device writes no file
@@ -332,18 +338,35 @@ impl Interpreter {
         // same prologue takes its CMYK→ICC branch instead.
         stet_ops::register_pdf_authoring_ops(&mut self.ctx);
 
-        let exec_result = if is_eps {
-            if let Some((llx, lly, _, _)) = read_eps_bounding_box(ps_data) {
-                self.exec_eps(ps_data, llx, lly)
-            } else {
-                let result = parse_and_exec(&mut self.ctx, ps_data);
-                job_result(&self.ctx, result)
-            }
+        self.last_error = None;
+        let eps_box = if is_eps { read_eps_bounding_box(ps_data) } else { None };
+        let exec_result = if let Some((llx, lly, _, _)) = eps_box {
+            self.exec_eps(ps_data, llx, lly)
         } else {
             let result = parse_and_exec(&mut self.ctx, ps_data);
-            job_result(&self.ctx, result)
+            let result = job_result(&self.ctx, result);
+            // As `render_ps`: the pages shown before an error, and the one
+            // being painted, are kept when the caller asked for them.
+            match result {
+                Err(e) if self.keep_partial => {
+                    self.flush_partial_page();
+                    Err(e)
+                }
+                r => r,
+            }
         };
-        let exec_result = exec_result.and_then(|()| self.end_page_device());
+        let exec_result = match exec_result {
+            Ok(()) => self.end_page_device(),
+            Err(e) => Err(e),
+        };
+        let exec_result = exec_result.map_err(|e| self.named_error(e));
+        let exec_result = match exec_result {
+            Err(e) if self.keep_partial => {
+                self.last_error = Some(e);
+                Ok(())
+            }
+            r => r,
+        };
 
         self.record_end_of_job_warnings();
 
@@ -768,6 +791,16 @@ impl InterpreterBuilder {
         self
     }
 
+    /// Embed the Standard 14 fonts in PDF output too
+    /// ([`Interpreter::render_to_pdf`]), from the interpreter's own copies,
+    /// rather than naming them for the viewer to supply. PDF/A and print
+    /// production require every font embedded; Ghostscript's pdfwrite
+    /// embeds them by default. Off by default.
+    pub fn embed_standard_fonts(mut self) -> Self {
+        self.embed_standard_fonts = true;
+        self
+    }
+
     /// Build the interpreter.
     pub fn build(self) -> Interpreter {
         let mut ctx = init::create_initialized_context(self.use_icc, self.suppress_output)
@@ -784,6 +817,7 @@ impl InterpreterBuilder {
             keep_partial: self.keep_partial,
             last_error: None,
             default_page: self.default_page,
+            embed_standard_fonts: self.embed_standard_fonts,
         }
     }
 }
