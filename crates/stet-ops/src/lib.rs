@@ -806,11 +806,39 @@ pub fn build_system_dict(ctx: &mut Context) {
     // --- Default error handlers in errordict ---
     setup_errordict(ctx);
 
-    // --- Version string ---
-    let version_entity = vm_ops::alloc_string_in(ctx, b"0.1.0", true);
-    let version_obj = PsObject::string(version_entity, 5);
-    let version_name = ctx.names.intern(b"version");
-    ctx.dicts.put(sd, DictKey::Name(version_name), version_obj);
+    // --- Version strings, allocated once: a job switches between them ---
+    for (key, text) in [(VERSION_KEY, VERSION), (PDF_VERSION_KEY, PDF_VERSION)] {
+        let entity = vm_ops::alloc_string_in(ctx, text, true);
+        let obj = PsObject::string(entity, text.len() as u32);
+        let name = ctx.names.intern(key);
+        ctx.dicts.put(sd, DictKey::Name(name), obj);
+    }
+    set_version(ctx, VERSION_KEY);
+}
+
+/// The interpreter version `version` reports.
+const VERSION: &[u8] = b"0.1.0";
+
+/// The version `version` reports while the PDF authoring operators are
+/// registered: Ghostscript's and Adobe's LanguageLevel 3 interpreters
+/// report 3010. Adobe's AGM procset (Illustrator, InDesign, Photoshop EPS)
+/// avoids Separation colour spaces on an interpreter older than 2012
+/// (`AGMCORE_avoid_L2_sep_space`) and writes spot colours as CMYK, which a
+/// PDF writer must keep.
+const PDF_VERSION: &[u8] = b"3010";
+
+/// Where systemdict keeps the two version strings.
+const VERSION_KEY: &[u8] = b".stetversion";
+const PDF_VERSION_KEY: &[u8] = b".stetpdfversion";
+
+/// Make `version` report the string systemdict keeps under `key`.
+fn set_version(ctx: &mut Context, key: &[u8]) {
+    let sd = ctx.systemdict;
+    let from = ctx.names.intern(key);
+    if let Some(obj) = ctx.dicts.get(sd, &DictKey::Name(from)) {
+        let name = ctx.names.intern(b"version");
+        ctx.dicts.put(sd, DictKey::Name(name), obj);
+    }
 }
 
 /// Register the PDF authoring operators — `pdfmark`, `currentdistillerparams`,
@@ -847,6 +875,7 @@ pub fn register_pdf_authoring_ops(ctx: &mut Context) {
         ctx.dicts
             .put(sd, DictKey::Name(name_id), PsObject::operator(opcode));
     }
+    set_version(ctx, PDF_VERSION_KEY);
 }
 
 /// Take the PDF authoring operators out of `systemdict` again, so that
@@ -860,6 +889,7 @@ pub fn remove_pdf_authoring_ops(ctx: &mut Context) {
             ctx.dicts.remove(sd, &DictKey::Name(name_id));
         }
     }
+    set_version(ctx, VERSION_KEY);
 }
 
 /// An operator's implementation.
