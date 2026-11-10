@@ -831,6 +831,14 @@ const PDF_VERSION: &[u8] = b"3010";
 const VERSION_KEY: &[u8] = b".stetversion";
 const PDF_VERSION_KEY: &[u8] = b".stetpdfversion";
 
+/// Turn on or off `setcustomcolor`'s Separation colour spaces
+/// (`.customcolorseps` in systemdict; see sysdict.ps).
+fn set_custom_color_seps(ctx: &mut Context, on: bool) {
+    let sd = ctx.systemdict;
+    let name = ctx.names.intern(b".customcolorseps");
+    ctx.dicts.put(sd, DictKey::Name(name), PsObject::bool(on));
+}
+
 /// Make `version` report the string systemdict keeps under `key`.
 fn set_version(ctx: &mut Context, key: &[u8]) {
     let sd = ctx.systemdict;
@@ -876,6 +884,7 @@ pub fn register_pdf_authoring_ops(ctx: &mut Context) {
             .put(sd, DictKey::Name(name_id), PsObject::operator(opcode));
     }
     set_version(ctx, PDF_VERSION_KEY);
+    set_custom_color_seps(ctx, true);
 }
 
 /// Take the PDF authoring operators out of `systemdict` again, so that
@@ -890,6 +899,7 @@ pub fn remove_pdf_authoring_ops(ctx: &mut Context) {
         }
     }
     set_version(ctx, VERSION_KEY);
+    set_custom_color_seps(ctx, false);
 }
 
 /// An operator's implementation.
