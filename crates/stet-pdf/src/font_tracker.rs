@@ -71,6 +71,10 @@ pub struct FontUsage {
     pub used_codes: HashSet<u16>,
     /// Whether this is a Standard 14 font (skip embedding).
     pub is_standard_14: bool,
+    /// Drawn as outlines, not as text: the font could not be embedded and
+    /// the device was asked to embed every font
+    /// ([`PdfDevice::set_outline_unembedded`](crate::PdfDevice::set_outline_unembedded)).
+    pub outlined: bool,
     /// First TextParams seen (used for font_size, ctm, font_matrix).
     pub sample_params: TextParams,
     /// Glyph widths in 1000ths of a unit (char_code → width), for every
@@ -257,6 +261,7 @@ impl FontTracker {
                         && STANDARD_14.contains(&params.font_name.as_slice()),
                     sample_params: params.clone(),
                     widths: HashMap::new(),
+                    outlined: false,
                 });
                 group.push(idx);
                 idx
@@ -280,6 +285,13 @@ impl FontTracker {
         self.instance_to_font
             .get(&font)
             .map(|&i| self.fonts[i].pdf_name.as_str())
+    }
+
+    /// Whether a font instance's resource is drawn as outlines.
+    pub fn is_outlined(&self, font: FontId) -> bool {
+        self.instance_to_font
+            .get(&font)
+            .is_some_and(|&i| self.fonts[i].outlined)
     }
 
     /// Iterate over all tracked fonts.

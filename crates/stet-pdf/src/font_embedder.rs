@@ -1143,6 +1143,12 @@ fn build_type1_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData)
     } else {
         None
     };
+    // No program to embed (no CharStrings in any instance, or one that could
+    // not be written): not embeddable, so the caller names the font or, when
+    // every font must be embedded, draws its text as outlines.
+    if font_file_ref.is_none() && !usage.is_standard_14 {
+        return None;
+    }
 
     // Build FontDescriptor. An embedded program holds only the glyphs used,
     // so its name carries a subset tag (ISO 32000-1 §9.6.4).

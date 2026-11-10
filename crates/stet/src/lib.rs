@@ -324,6 +324,7 @@ impl Interpreter {
         self.ctx.device_factory = Some(Box::new(move |w, h| {
             let mut dev = stet_pdf::PdfDevice::in_memory(w, h, dpi_val);
             dev.set_embed_standard_14(embed_standard_14);
+            dev.set_outline_unembedded(embed_standard_14);
             Box::new(dev) as Box<dyn OutputDevice>
         }));
 
@@ -795,7 +796,9 @@ impl InterpreterBuilder {
     /// ([`Interpreter::render_to_pdf`]), from the interpreter's own copies,
     /// rather than naming them for the viewer to supply. PDF/A and print
     /// production require every font embedded; Ghostscript's pdfwrite
-    /// embeds them by default. Off by default.
+    /// embeds them by default. Text in a font that cannot be embedded at all
+    /// is then drawn as its glyph outlines, so every font the PDF names is
+    /// embedded. Off by default.
     pub fn embed_standard_fonts(mut self) -> Self {
         self.embed_standard_fonts = true;
         self
