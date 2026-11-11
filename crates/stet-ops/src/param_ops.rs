@@ -204,12 +204,24 @@ pub fn op_setdistillerparams(ctx: &mut Context) -> Result<(), PsError> {
 /// only stream injection on `< 5000` route their binary metadata
 /// streams down the `flushfile cleartomark` path stet can actually
 /// handle. See [`op_setdistillerparams`].
+///
+/// It also says what stet's PDF writer does with colour, as Ghostscript's
+/// pdfwrite answers by default: overprint is kept
+/// (`PreserveOverprintSettings`) and colour is left as the job paints it
+/// (`ColorConversionStrategy /LeaveColorUnchanged`). Adobe's AGM procset
+/// reads both before it writes overprint and spot-colour images for a
+/// distiller rather than simulating them.
 pub fn op_currentdistillerparams(ctx: &mut Context) -> Result<(), PsError> {
     let d = crate::vm_ops::alloc_dict(ctx, 8, b"distillerparams");
     let core = ctx.names.intern(b"CoreDistVersion");
     ctx.dicts.put(d, DictKey::Name(core), PsObject::int(4000));
     let compat = ctx.names.intern(b"CompatibilityLevel");
     ctx.dicts.put(d, DictKey::Name(compat), PsObject::real(1.7));
+    let preserve = ctx.names.intern(b"PreserveOverprintSettings");
+    ctx.dicts.put(d, DictKey::Name(preserve), PsObject::bool(true));
+    let strategy = ctx.names.intern(b"ColorConversionStrategy");
+    let unchanged = ctx.names.intern(b"LeaveColorUnchanged");
+    ctx.dicts.put(d, DictKey::Name(strategy), PsObject::name_lit(unchanged));
     ctx.o_stack.push(PsObject::dict(d))?;
     Ok(())
 }

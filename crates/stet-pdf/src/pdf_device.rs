@@ -71,6 +71,11 @@ pub struct PdfDevice {
     /// The document is taken as bytes (`take_pdf_bytes*`), never written to
     /// a file: see [`Self::in_memory`].
     in_memory: bool,
+    /// Embed the Standard 14 fonts too: see [`Self::set_embed_standard_14`].
+    embed_standard_14: bool,
+    /// Draw text in a font that cannot be embedded as outlines: see
+    /// [`Self::set_outline_unembedded`].
+    outline_unembedded: bool,
 }
 
 impl PdfDevice {
@@ -89,6 +94,8 @@ impl PdfDevice {
             output_intents: Vec::new(),
             emit_page_box_clip: true,
             in_memory: false,
+            embed_standard_14: false,
+            outline_unembedded: false,
         }
     }
 
@@ -110,6 +117,24 @@ impl PdfDevice {
             in_memory: true,
             ..Self::new(width, height, dpi)
         }
+    }
+
+    /// Embed the Standard 14 fonts (Times, Helvetica, Courier, Symbol,
+    /// ZapfDingbats) from the interpreter's copies, as every other font, in
+    /// place of naming them for the viewer to supply. PDF/A and print
+    /// production require every font embedded, and Ghostscript's pdfwrite
+    /// embeds them by default. Default `false`.
+    pub fn set_embed_standard_14(&mut self, on: bool) {
+        self.embed_standard_14 = on;
+    }
+
+    /// Draw the text of a font that cannot be embedded (no copy of it, a
+    /// font kind the embedder does not write) as its glyph outlines, rather
+    /// than naming the font for the viewer to supply: every font the PDF
+    /// names is then embedded. That text is no longer extractable. Default
+    /// `false`.
+    pub fn set_outline_unembedded(&mut self, on: bool) {
+        self.outline_unembedded = on;
     }
 
     /// Control whether to emit the implicit `0 0 W H re W n` page-box clip
@@ -331,6 +356,7 @@ impl PdfDevice {
 
         // Document-level font tracker — shared across all pages
         let mut font_tracker = FontTracker::new();
+        font_tracker.set_embed_standard_14(self.embed_standard_14);
 
         // Track every page's fonts first — the text in its groups, soft
         // masks, layers and pattern tiles too — so each resource's widths
@@ -341,6 +367,9 @@ impl PdfDevice {
         }
         if let Some(f) = fonts {
             content_stream::measure_widths(&mut font_tracker, f);
+        }
+        if self.outline_unembedded {
+            mark_unembeddable(&mut font_tracker, fonts);
         }
 
         // Then build the content streams
@@ -692,7 +721,7 @@ impl PdfDevice {
         fonts: Option<&FontData>,
     ) -> HashMap<String, u32> {
         let mut map = HashMap::new();
-        for usage in font_tracker.fonts() {
+        for usage in font_tracker.fonts().filter(|u| !u.outlined) {
             // A font is embedded from the interpreter's copy of it; text
             // shown without one gets a reference to the font by name.
             let font_ref = match fonts.filter(|_| usage.root.is_some()) {
@@ -1255,6 +1284,10 @@ impl PdfDevice {
             entries.push((b"Mask".to_vec(), PdfObj::Array(mask_ints)));
         }
 
+        if let Some(jpeg) = &img.jpeg {
+            entries.push((b"Filter".to_vec(), PdfObj::name("DCTDecode")));
+            return writer.add_stream(entries, jpeg, false);
+        }
         writer.add_stream(entries, &img.sample_data, true)
     }
 }
@@ -2294,6 +2327,30 @@ fn build_ve_array(
             Some(&r) => PdfObj::Ref(r),
             None => PdfObj::Null,
         },
+    }
+}
+
+/// Mark each font the embedder cannot write (no copy of it, or a kind it
+/// does not embed) to be drawn as outlines. Standard 14 fonts left named on
+/// purpose ([`PdfDevice::set_embed_standard_14`] off) are not marked. Each
+/// font is embedded into a scratch writer to find out, so the answer is the
+/// embedder's own.
+fn mark_unembeddable(font_tracker: &mut FontTracker, fonts: Option<&FontData>) {
+    let mut scratch = PdfWriter::new();
+    let unembeddable: Vec<bool> = font_tracker
+        .fonts()
+        .map(|usage| {
+            if usage.is_standard_14 {
+                return false;
+            }
+            match fonts.filter(|_| usage.root.is_some()) {
+                Some(f) => font_embedder::build_font_resource(&mut scratch, usage, f).is_none(),
+                None => true,
+            }
+        })
+        .collect();
+    for (usage, outline) in font_tracker.fonts_mut().zip(unembeddable) {
+        usage.outlined = outline;
     }
 }
 

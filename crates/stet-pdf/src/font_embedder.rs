@@ -1011,30 +1011,55 @@ fn type1_widths(
 /// no width.
 fn type42_widths(
     fonts: &FontData,
-    font: &FrozenDict,
+    usage: &FontUsage,
     font_data: &[u8],
     codes: impl IntoIterator<Item = u16>,
 ) -> HashMap<u16, i32> {
     let scale = 1000.0 / truetype::get_units_per_em(font_data) as f64;
     let mut widths: HashMap<u16, i32> = HashMap::new();
-    let (Some(enc), Some(cs)) = (
-        encoding_of(fonts, font),
-        dict_of(fonts, font, b"CharStrings"),
-    ) else {
-        return widths;
-    };
     for code in codes {
-        let Some(glyph_name_id) = glyph_at(enc, code) else {
+        let Some(gid) = type42_gid(fonts, usage, code) else {
             continue;
         };
-        let Some(gid) = cs.get_name(glyph_name_id).and_then(Frozen::as_i32) else {
-            continue;
-        };
-        if let Some(aw) = truetype::get_advance_width(font_data, gid as u16) {
+        if let Some(aw) = truetype::get_advance_width(font_data, gid) {
             widths.insert(code, (aw as f64 * scale).round() as i32);
         }
     }
     widths
+}
+
+/// A subset font's PDF name: six upper-case letters, `+`, the font's name.
+/// The tag is the same for the same font and glyphs, so output is
+/// reproducible; a name that already carries a tag keeps it.
+fn subset_name(name: &[u8], resource: &str, codes: &HashSet<u16>) -> Vec<u8> {
+    let tagged = name.len() > 7
+        && name[6] == b'+'
+        && name[..6].iter().all(|c| c.is_ascii_uppercase());
+    if tagged {
+        return name.to_vec();
+    }
+    // FNV-1a over the name, the resource and the codes, in order.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    name.iter().for_each(|&b| eat(b));
+    resource.bytes().for_each(&mut eat);
+    let mut sorted: Vec<u16> = codes.iter().copied().collect();
+    sorted.sort_unstable();
+    for c in sorted {
+        eat((c >> 8) as u8);
+        eat(c as u8);
+    }
+    let mut out = Vec::with_capacity(name.len() + 7);
+    for _ in 0..6 {
+        out.push(b'A' + (h % 26) as u8);
+        h /= 26;
+    }
+    out.push(b'+');
+    out.extend_from_slice(name);
+    out
 }
 
 /// Build a Type 1 font resource.
@@ -1109,12 +1134,24 @@ fn build_type1_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData)
     } else {
         None
     };
+    // No program to embed (no CharStrings in any instance, or one that could
+    // not be written): not embeddable, so the caller names the font or, when
+    // every font must be embedded, draws its text as outlines.
+    if font_file_ref.is_none() && !usage.is_standard_14 {
+        return None;
+    }
 
-    // Build FontDescriptor
+    // Build FontDescriptor. An embedded program holds only the glyphs used,
+    // so its name carries a subset tag (ISO 32000-1 §9.6.4).
+    let base_font = if font_file_ref.is_some() {
+        subset_name(&usage.font_name, &usage.pdf_name, &usage.used_codes)
+    } else {
+        usage.font_name.clone()
+    };
     let bbox = get_font_bbox(fonts, font);
     let flags = compute_font_flags(font);
     let descriptor_ref =
-        build_font_descriptor(writer, &usage.font_name, &bbox, flags, font_file_ref, None);
+        build_font_descriptor(writer, &base_font, &bbox, flags, font_file_ref, None);
 
     // Build Encoding with Differences array merged from all font instances
     let encoding_obj =
@@ -1124,7 +1161,7 @@ fn build_type1_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData)
     let mut font_entries: Vec<(Vec<u8>, PdfObj)> = vec![
         (b"Type".to_vec(), PdfObj::name("Font")),
         (b"Subtype".to_vec(), PdfObj::name("Type1")),
-        (b"BaseFont".to_vec(), PdfObj::Name(usage.font_name.clone())),
+        (b"BaseFont".to_vec(), PdfObj::Name(base_font.clone())),
         (b"FirstChar".to_vec(), PdfObj::Int(first_char as i64)),
         (b"LastChar".to_vec(), PdfObj::Int(last_char as i64)),
         (b"Widths".to_vec(), PdfObj::Array(widths_array)),
@@ -1647,10 +1684,17 @@ fn subset_truetype(font_data: &[u8], used_gids: &HashSet<u16>) -> Option<Vec<u8>
 fn reconstruct_truetype(
     raw_sfnts: &[u8],
     fonts: &FontData,
-    cidfont: &FrozenDict,
+    instances: &[&FrozenDict],
 ) -> Option<Vec<u8>> {
-    // Get GlyphDirectory dict from the CIDFont
-    let glyph_directory = dict_of(fonts, cidfont, b"GlyphDirectory")?;
+    // The GlyphDirectory of every instance: a font downloaded incrementally
+    // (Windows printer drivers' Type 42 fonts) adds glyphs to it as the job
+    // goes, so each copy holds the glyphs defined by then.
+    if !instances
+        .iter()
+        .any(|f| fonts.get(f, b"GlyphDirectory").is_some())
+    {
+        return None;
+    }
 
     // Get numGlyphs from maxp table
     let (maxp_off, _) = truetype::find_table(raw_sfnts, b"maxp")?;
@@ -1668,8 +1712,9 @@ fn reconstruct_truetype(
 
     for gid in 0..num_glyphs {
         loca_offsets.push(glyf_data.len() as u32);
-        if let Some(Frozen::String(glyph_bytes)) = glyph_directory.get(&DictKey::Int(gid as i64))
-            && !glyph_bytes.is_empty()
+        if let Some(glyph_bytes) = instances
+            .iter()
+            .find_map(|f| glyph_directory_entry(fonts, f, gid))
         {
             glyf_data.extend_from_slice(glyph_bytes);
             // Pad to 2-byte alignment
@@ -1731,6 +1776,54 @@ fn reconstruct_truetype(
     Some(assemble_truetype(&keep_tables))
 }
 
+/// A font's GlyphDirectory entry for `gid` (PLRM 3e §5.9.2: a dictionary
+/// or an array of glyph descriptions), when it has a non-empty one.
+fn glyph_directory_entry<'d>(fonts: &FontData, font: &'d FrozenDict, gid: usize) -> Option<&'d [u8]> {
+    let entry = match fonts.get(font, b"GlyphDirectory")? {
+        Frozen::Array(items) => items.get(gid),
+        _ => dict_of(fonts, font, b"GlyphDirectory")?.get(&DictKey::Int(gid as i64)),
+    };
+    match entry {
+        Some(Frozen::String(bytes)) if !bytes.is_empty() => Some(&bytes[..]),
+        _ => None,
+    }
+}
+
+/// A Type 42 font's TrueType program: its sfnts, with `glyf` and `loca`
+/// rebuilt from the GlyphDirectory of every instance when the sfnts carry
+/// none (Windows printer drivers download Type 42 fonts glyph by glyph, with
+/// a `gdir` table in place of `glyf`).
+fn type42_program(fonts: &FontData, usage: &FontUsage) -> Option<Vec<u8>> {
+    let root = usage.root.as_deref()?;
+    let raw = concatenate_sfnts(fonts, root)?;
+    let has_outlines = truetype::find_table(&raw, b"glyf").is_some_and(|(_, len)| len > 0)
+        && truetype::find_table(&raw, b"loca").is_some();
+    if has_outlines {
+        return Some(raw);
+    }
+    let mut instances: Vec<&FrozenDict> = usage.program_fonts.iter().map(|f| &**f).collect();
+    instances.extend(usage.all_fonts.iter().map(|f| &**f));
+    instances.reverse(); // the latest copy first: it holds the most glyphs
+    Some(reconstruct_truetype(&raw, fonts, &instances).unwrap_or(raw))
+}
+
+/// The glyph index a Type 42 resource's `code` draws: the first instance
+/// whose Encoding names a glyph (not `.notdef`) at the code, looked up in
+/// the CharStrings of that instance or, failing that, of any other. A font
+/// downloaded incrementally adds names to its Encoding and CharStrings as
+/// the job goes, so the first copy lacks the later glyphs.
+fn type42_gid(fonts: &FontData, usage: &FontUsage, code: u16) -> Option<u16> {
+    let notdef = fonts.find(b".notdef");
+    let instances = || usage.all_fonts.iter().rev();
+    let name = instances().find_map(|f| {
+        glyph_at(encoding_of(fonts, f)?, code).filter(|&n| Some(n) != notdef)
+    })?;
+    instances()
+        .chain(usage.program_fonts.iter().rev())
+        .find_map(|f| dict_of(fonts, f, b"CharStrings")?.get_name(name).and_then(Frozen::as_i32))
+        .and_then(|gid| u16::try_from(gid).ok())
+}
+
 /// Assemble a TrueType font binary from a list of (tag, data) pairs.
 ///
 /// Builds the offset table, table directory, and concatenated table data
@@ -1782,6 +1875,91 @@ fn assemble_truetype(tables: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
     }
 
     result
+}
+
+/// The sfnt with its cmap replaced by one that maps exactly `code_gids`: a
+/// (1,0) subtable at the code and a (3,0) subtable at U+F000 + code, both
+/// format 4, which is how a symbolic TrueType font in a PDF is read
+/// (ISO 32000-1 §9.6.6.4). `None` when the sfnt's table directory can't be read.
+fn with_symbolic_cmap(
+    font_data: &[u8],
+    code_gids: &std::collections::BTreeMap<u8, u16>,
+) -> Option<Vec<u8>> {
+    if font_data.len() < 12 {
+        return None;
+    }
+    let num_tables = truetype::read_u16(font_data, 4) as usize;
+    let mut tables: Vec<(&[u8], Vec<u8>)> = Vec::with_capacity(num_tables + 1);
+    for i in 0..num_tables {
+        let entry = 12 + i * 16;
+        if entry + 16 > font_data.len() {
+            return None;
+        }
+        let tag = &font_data[entry..entry + 4];
+        if tag == b"cmap" {
+            continue;
+        }
+        let offset = truetype::read_u32(font_data, entry + 8) as usize;
+        let length = truetype::read_u32(font_data, entry + 12) as usize;
+        let data = font_data.get(offset..offset.checked_add(length)?)?;
+        tables.push((tag, data.to_vec()));
+    }
+
+    let mac: Vec<(u16, u16)> = code_gids.iter().map(|(&c, &g)| (c as u16, g)).collect();
+    let windows: Vec<(u16, u16)> =
+        code_gids.iter().map(|(&c, &g)| (0xF000 + c as u16, g)).collect();
+    let mac_sub = cmap_format4(&mac);
+    let win_sub = cmap_format4(&windows);
+    let mut cmap = Vec::with_capacity(20 + mac_sub.len() + win_sub.len());
+    cmap.extend(0u16.to_be_bytes()); // version
+    cmap.extend(2u16.to_be_bytes()); // subtables, sorted by platform
+    cmap.extend(1u16.to_be_bytes()); // Macintosh
+    cmap.extend(0u16.to_be_bytes()); // Roman
+    cmap.extend(20u32.to_be_bytes());
+    cmap.extend(3u16.to_be_bytes()); // Windows
+    cmap.extend(0u16.to_be_bytes()); // Symbol
+    cmap.extend((20 + mac_sub.len() as u32).to_be_bytes());
+    cmap.extend(mac_sub);
+    cmap.extend(win_sub);
+    tables.push((b"cmap", cmap));
+    tables.sort_by_key(|(tag, _)| *tag);
+    Some(assemble_truetype(&tables))
+}
+
+/// A format 4 cmap subtable with one segment per code (codes ascending), plus
+/// the closing 0xFFFF segment.
+fn cmap_format4(map: &[(u16, u16)]) -> Vec<u8> {
+    let seg_count = map.len() as u16 + 1;
+    // searchRange = 2 × the largest power of two ≤ segCount.
+    let entry_selector = 15 - seg_count.leading_zeros() as u16;
+    let search_range = 2 * (1u16 << entry_selector);
+    let range_shift = seg_count * 2 - search_range;
+    let length = 16 + seg_count as usize * 8;
+    let mut out = Vec::with_capacity(length);
+    out.extend(4u16.to_be_bytes());
+    out.extend((length as u16).to_be_bytes());
+    out.extend(0u16.to_be_bytes()); // language
+    out.extend((seg_count * 2).to_be_bytes());
+    out.extend(search_range.to_be_bytes());
+    out.extend(entry_selector.to_be_bytes());
+    out.extend(range_shift.to_be_bytes());
+    for &(code, _) in map {
+        out.extend(code.to_be_bytes()); // endCode
+    }
+    out.extend(0xFFFFu16.to_be_bytes());
+    out.extend(0u16.to_be_bytes()); // reservedPad
+    for &(code, _) in map {
+        out.extend(code.to_be_bytes()); // startCode
+    }
+    out.extend(0xFFFFu16.to_be_bytes());
+    for &(code, gid) in map {
+        out.extend(gid.wrapping_sub(code).to_be_bytes()); // idDelta
+    }
+    out.extend(1u16.to_be_bytes());
+    for _ in 0..seg_count {
+        out.extend(0u16.to_be_bytes()); // idRangeOffset
+    }
+    out
 }
 
 /// Calculate TrueType table checksum (sum of uint32 values).
@@ -2271,7 +2449,7 @@ impl CidTrueType {
         let rebuilt = truetype::find_table(&raw_font_data, b"glyf").is_none()
             || truetype::find_table(&raw_font_data, b"loca").is_none();
         let font_data = if rebuilt {
-            reconstruct_truetype(&raw_font_data, fonts, cidfont).unwrap_or(raw_font_data)
+            reconstruct_truetype(&raw_font_data, fonts, &[cidfont]).unwrap_or(raw_font_data)
         } else {
             raw_font_data
         };
@@ -2511,16 +2689,13 @@ fn build_type42_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData
     let font = usage.root.as_deref()?;
     let font_name_str = String::from_utf8_lossy(&usage.font_name);
 
-    // Extract TrueType binary from sfnts array on the font dict itself
-    let font_data = concatenate_sfnts(fonts, font)?;
+    // The TrueType program, with any glyphs downloaded into GlyphDirectory
+    let font_data = type42_program(fonts, usage)?;
     let units_per_em = truetype::get_units_per_em(&font_data);
     let scale = 1000.0 / units_per_em as f64;
 
     // Get encoding array
     let encoding = encoding_of(fonts, font);
-
-    // Get CharStrings dict (maps glyph names → GID integers for Type 42)
-    let charstrings = dict_of(fonts, font, b"CharStrings");
 
     // Determine FirstChar/LastChar
     let mut first_char: u16 = 255;
@@ -2537,7 +2712,7 @@ fn build_type42_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData
     }
 
     // Widths for every code in FirstChar..LastChar, not just the used ones.
-    let widths = type42_widths(fonts, font, &font_data, first_char..=last_char);
+    let widths = type42_widths(fonts, usage, &font_data, first_char..=last_char);
 
     // Build Widths array
     let widths_array: Vec<PdfObj> = (first_char..=last_char)
@@ -2545,7 +2720,15 @@ fn build_type42_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData
         .collect();
 
     // Build ToUnicode CMap
-    let tounicode_map = build_tounicode_map(fonts, encoding, &usage.used_codes);
+    // (merged over every instance: a font downloaded glyph by glyph adds
+    // codes to its Encoding as the job goes)
+    let all_encodings: Vec<Option<&[Frozen]>> = usage
+        .all_fonts
+        .iter()
+        .rev()
+        .map(|instance| encoding_of(fonts, instance))
+        .collect();
+    let tounicode_map = build_tounicode_map_multi(fonts, &all_encodings, &usage.used_codes);
     let tounicode_ref = if !tounicode_map.is_empty() {
         let cmap_data = generate_tounicode_cmap(&tounicode_map, &font_name_str);
         Some(writer.add_stream(Vec::new(), &cmap_data, true))
@@ -2553,27 +2736,40 @@ fn build_type42_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData
         None
     };
 
-    // Subset TrueType font: collect used GIDs via Encoding → CharStrings mapping
-    let font_data = if let (Some(enc), Some(cs)) = (encoding, charstrings) {
-        let mut seed_gids: HashSet<u16> = HashSet::new();
-        for &code in &usage.used_codes {
-            if code > 255 {
-                continue;
-            }
-            if let Some(name_id) = glyph_at(enc, code)
-                && let Some(gid) = cs.get_name(name_id).and_then(Frozen::as_i32)
-            {
-                seed_gids.insert(gid as u16);
-            }
-        }
-        if seed_gids.is_empty() {
-            font_data // can't determine used GIDs, embed whole
-        } else {
-            let used_gids = compute_used_gids(&font_data, &seed_gids);
-            subset_truetype(&font_data, &used_gids).unwrap_or(font_data)
-        }
+    // The glyph each code draws, as the PostScript draws it: Encoding → CharStrings → GID. A viewer
+    // that maps codes through the font's own cmap or glyph names (a nonsymbolic TrueType) draws
+    // other glyphs when the sfnt's cmap and post table don't agree with the CharStrings, as in
+    // the Type 42 fonts Windows printer drivers write; so the font is written as Ghostscript
+    // writes one, symbolic, with a cmap of exactly these codes.
+    let code_gids: std::collections::BTreeMap<u8, u16> = usage
+        .used_codes
+        .iter()
+        .filter(|&&code| code <= 255)
+        .filter_map(|&code| type42_gid(fonts, usage, code).map(|gid| (code as u8, gid)))
+        .collect();
+
+    // Subset to the glyphs those codes draw (and the components they use).
+    let (font_data, subset) = if code_gids.is_empty() {
+        (font_data, false) // can't determine used GIDs, embed whole
     } else {
-        font_data // no Encoding/CharStrings, embed whole
+        let seed_gids: HashSet<u16> = code_gids.values().copied().collect();
+        let used_gids = compute_used_gids(&font_data, &seed_gids);
+        match subset_truetype(&font_data, &used_gids) {
+            Some(sub) => (sub, true),
+            None => (font_data, false),
+        }
+    };
+    let symbolic_data = if code_gids.is_empty() {
+        None
+    } else {
+        with_symbolic_cmap(&font_data, &code_gids)
+    };
+    let symbolic = symbolic_data.is_some();
+    let font_data = symbolic_data.unwrap_or(font_data);
+    let base_font = if subset {
+        subset_name(&usage.font_name, &usage.pdf_name, &usage.used_codes)
+    } else {
+        usage.font_name.clone()
     };
 
     // Embed TrueType binary as FontFile2
@@ -2588,8 +2784,9 @@ fn build_type42_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData
     let descriptor_ref = {
         let entries = vec![
             (b"Type".to_vec(), PdfObj::name("FontDescriptor")),
-            (b"FontName".to_vec(), PdfObj::Name(usage.font_name.clone())),
-            (b"Flags".to_vec(), PdfObj::Int(0x0020)), // Nonsymbolic
+            (b"FontName".to_vec(), PdfObj::Name(base_font.clone())),
+            // Symbolic: the font's own cmap maps the codes; Nonsymbolic: names through the Encoding
+            (b"Flags".to_vec(), PdfObj::Int(if symbolic { 0x0004 } else { 0x0020 })),
             (
                 b"FontBBox".to_vec(),
                 PdfObj::Array(bbox.iter().map(|&v| PdfObj::Real(v)).collect()),
@@ -2611,14 +2808,15 @@ fn build_type42_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData
     let mut font_entries: Vec<(Vec<u8>, PdfObj)> = vec![
         (b"Type".to_vec(), PdfObj::name("Font")),
         (b"Subtype".to_vec(), PdfObj::name("TrueType")),
-        (b"BaseFont".to_vec(), PdfObj::Name(usage.font_name.clone())),
+        (b"BaseFont".to_vec(), PdfObj::Name(base_font)),
         (b"FirstChar".to_vec(), PdfObj::Int(first_char as i64)),
         (b"LastChar".to_vec(), PdfObj::Int(last_char as i64)),
         (b"Widths".to_vec(), PdfObj::Array(widths_array)),
         (b"FontDescriptor".to_vec(), PdfObj::Ref(descriptor_ref)),
     ];
 
-    if let Some(enc) = encoding_obj {
+    // A symbolic font has no Encoding: an Encoding would send viewers to glyph names again.
+    if let Some(enc) = encoding_obj.filter(|_| !symbolic) {
         font_entries.push((b"Encoding".to_vec(), enc));
     }
     if let Some(tu_ref) = tounicode_ref {
@@ -2663,8 +2861,8 @@ pub fn glyph_widths(usage: &FontUsage, fonts: &FontData) -> HashMap<u16, i32> {
                     })
                     .unwrap_or_default()
             }
-            None => concatenate_sfnts(fonts, font)
-                .map(|data| type42_widths(fonts, font, &data, codes))
+            None => type42_program(fonts, usage)
+                .map(|data| type42_widths(fonts, usage, &data, codes))
                 .unwrap_or_default(),
         },
         _ => HashMap::new(),

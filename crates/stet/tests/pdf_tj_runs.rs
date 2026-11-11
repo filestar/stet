@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::{hex, sfnt_with_cmap};
+use common::{hex, sfnt_incremental, sfnt_with_cmap};
 use stet::{DisplayElement, Interpreter};
 use stet_fonts::geometry::PathSegment;
 
@@ -153,4 +153,71 @@ fn type42_runs_join_in_any_instance_and_page() {
         hex(&sfnt_with_cmap(&[(97, 1), (98, 2)]))
     );
     assert_eq!(runs(&job), [JOINED, JOINED]);
+}
+
+/// A Type 42 font whose sfnt cmap disagrees with its CharStrings, under glyph
+/// names no viewer knows, as Windows printer drivers write them: the PDF draws
+/// the glyphs the CharStrings name (the square for `a`, the bar for `b`), since
+/// the font goes out symbolic with a cmap of exactly the codes the text uses.
+#[test]
+fn a_type42_font_draws_its_charstrings_glyphs() {
+    let job = format!(
+        "%!PS\n<< /PageSize [300 200] >> setpagedevice\n\
+         /T42 <<\n\
+           /FontType 42 /FontName /T42 /PaintType 0\n\
+           /FontMatrix [1 0 0 1 0 0] /FontBBox [0 0 1000 1000]\n\
+           /Encoding 256 array dup 0 1 255 {{ /.notdef put dup }} for pop\n\
+             dup 97 /G01 put dup 98 /G02 put\n\
+           /CharStrings << /.notdef 0 /G01 1 /G02 2 >>\n\
+           /sfnts [<{}>]\n\
+         >> definefont pop\n\
+         /T42 findfont 20 scalefont setfont\n\
+         20 80 moveto (ab) show\n\
+         showpage\n",
+        hex(&sfnt_with_cmap(&[(97, 2), (98, 1)]))
+    );
+    runs(&job);
+    let pdf = Interpreter::new().render_to_pdf(job.as_bytes(), 72.0).unwrap();
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains("/Flags 4"), "the font is symbolic");
+    assert!(!text.contains("/Differences"), "no Encoding sends a viewer to glyph names");
+}
+
+/// A Type 42 font downloaded glyph by glyph, as Windows printer drivers do:
+/// no `glyf` in its sfnts, each glyph added to its GlyphDirectory, Encoding
+/// and CharStrings just before the text that uses it. The PDF embeds every
+/// glyph the job drew, the later one too, and draws each where the
+/// PostScript does.
+#[test]
+fn a_type42_font_downloaded_glyph_by_glyph_keeps_every_glyph() {
+    let (sfnt, [square, bar]) = sfnt_incremental();
+    let job = format!(
+        "%!PS\n<< /PageSize [300 200] >> setpagedevice\n\
+         /T42 <<\n\
+           /FontType 42 /FontName /T42 /PaintType 0\n\
+           /FontMatrix [1 0 0 1 0 0] /FontBBox [0 0 1000 1000]\n\
+           /Encoding 256 array dup 0 1 255 {{ /.notdef put dup }} for pop\n\
+           /CharStrings 4 dict dup /.notdef 0 put\n\
+           /GlyphDirectory 4 dict\n\
+           /sfnts [<{}>]\n\
+         >> definefont pop\n\
+         /add {{ /T42 findfont begin GlyphDirectory 3 1 roll put\n\
+                 CharStrings 3 1 roll put Encoding 3 1 roll put end }} bind def\n\
+         97 /G01 /G01 1 1 <{}> add\n\
+         /T42 findfont 20 scalefont setfont 20 80 moveto (a) show\n\
+         98 /G02 /G02 2 2 <{}> add\n\
+         /T42 findfont 20 scalefont setfont 60 80 moveto (b) show\n\
+         showpage\n",
+        hex(&sfnt),
+        hex(&square),
+        hex(&bar)
+    );
+    runs(&job);
+    let pdf = Interpreter::new().render_to_pdf(job.as_bytes(), 72.0).unwrap();
+    let doc = stet_pdf_reader::PdfDocument::from_bytes(&pdf).unwrap();
+    let page = doc.render_page(0, 72.0).unwrap();
+    let fills = boxes(page.elements().iter());
+    assert_eq!(fills.len(), 2, "both glyphs drawn: {fills:?}");
+    let widths: Vec<f64> = fills.iter().map(|b| (b[2] - b[0]).round()).collect();
+    assert_eq!(widths, [20.0, 10.0], "the square, then the bar");
 }

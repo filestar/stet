@@ -34,7 +34,37 @@ pub fn sfnt_with_cmap(map: &[(u8, u8)]) -> Vec<u8> {
     sfnt_with(Some(cmap))
 }
 
+/// [`sfnt`] as a printer driver downloads it glyph by glyph: a `gdir` table
+/// in place of `glyf` and `loca`, and the glyph descriptions (index 1, the
+/// square; 2, the bar) for the font's `GlyphDirectory`.
+#[allow(dead_code)]
+pub fn sfnt_incremental() -> (Vec<u8>, [Vec<u8>; 2]) {
+    (sfnt_tables(None, false), [outline(1000), outline(500)])
+}
+
+/// One rectangle contour of `w` by 1000, four on-curve points.
+fn outline(w: i16) -> Vec<u8> {
+    let mut g = Vec::new();
+    for v in [1i16, 0, 0, w, 1000] {
+        g.extend(v.to_be_bytes()); // contours, xMin, yMin, xMax, yMax
+    }
+    g.extend(3u16.to_be_bytes()); // endPtsOfContours
+    g.extend(0u16.to_be_bytes()); // instructionLength
+    g.extend([1u8; 4]); // flags: on curve
+    for dx in [0i16, w, 0, -w] {
+        g.extend(dx.to_be_bytes());
+    }
+    for dy in [0i16, 0, 1000, 0] {
+        g.extend(dy.to_be_bytes());
+    }
+    g
+}
+
 fn sfnt_with(cmap: Option<Vec<u8>>) -> Vec<u8> {
+    sfnt_tables(cmap, true)
+}
+
+fn sfnt_tables(cmap: Option<Vec<u8>>, outlines: bool) -> Vec<u8> {
     let mut head = vec![0u8; 54];
     head[12..16].copy_from_slice(&0x5F0F_3CF5u32.to_be_bytes());
     head[18..20].copy_from_slice(&1000u16.to_be_bytes());
@@ -50,25 +80,8 @@ fn sfnt_with(cmap: Option<Vec<u8>>) -> Vec<u8> {
     maxp[0..4].copy_from_slice(&0x0000_5000u32.to_be_bytes());
     maxp[4..6].copy_from_slice(&3u16.to_be_bytes());
 
-    // One rectangle contour of `w` by 1000, four on-curve points.
-    let rect = |w: i16| {
-        let mut g = Vec::new();
-        for v in [1i16, 0, 0, w, 1000] {
-            g.extend(v.to_be_bytes()); // contours, xMin, yMin, xMax, yMax
-        }
-        g.extend(3u16.to_be_bytes()); // endPtsOfContours
-        g.extend(0u16.to_be_bytes()); // instructionLength
-        g.extend([1u8; 4]); // flags: on curve
-        for dx in [0i16, w, 0, -w] {
-            g.extend(dx.to_be_bytes());
-        }
-        for dy in [0i16, 0, 1000, 0] {
-            g.extend(dy.to_be_bytes());
-        }
-        g
-    };
-    let square = rect(1000);
-    let bar = rect(500);
+    let square = outline(1000);
+    let bar = outline(500);
     let mut glyf = square.clone();
     glyf.extend(&bar);
     let mut loca = Vec::new();
@@ -81,14 +94,16 @@ fn sfnt_with(cmap: Option<Vec<u8>>) -> Vec<u8> {
     if let Some(cmap) = &cmap {
         tables.push((b"cmap", cmap));
     }
-    tables.extend([
-        (b"glyf", glyf.as_slice()),
-        (b"head", &head),
-        (b"hhea", &hhea),
-        (b"hmtx", &hmtx),
-        (b"loca", &loca),
-        (b"maxp", &maxp),
-    ]);
+    if outlines {
+        tables.extend([(b"glyf", glyf.as_slice())]);
+    } else {
+        tables.extend([(b"gdir", &[][..])]);
+    }
+    tables.extend([(b"head", head.as_slice()), (b"hhea", &hhea), (b"hmtx", &hmtx)]);
+    if outlines {
+        tables.extend([(b"loca", loca.as_slice())]);
+    }
+    tables.extend([(b"maxp", maxp.as_slice())]);
     let mut font = Vec::new();
     font.extend(0x0001_0000u32.to_be_bytes());
     font.extend((tables.len() as u16).to_be_bytes());

@@ -386,6 +386,9 @@ struct Builder<'tracker> {
     form_xobjects: Vec<FormXObject>,
     page_font_names: HashSet<String>,
     has_text_elements: bool,
+    /// The last `Text` was in a font drawn as outlines: its glyph-path
+    /// fills, which follow it, are drawn rather than skipped.
+    outlining: bool,
     /// The device space, in device units: what `ErasePage` paints.
     page_w: f64,
     page_h: f64,
@@ -468,6 +471,7 @@ impl<'tracker> Builder<'tracker> {
             form_xobjects: Vec::new(),
             page_font_names: HashSet::new(),
             has_text_elements,
+            outlining: false,
             page_w,
             page_h,
             in_tile,
@@ -502,6 +506,13 @@ impl<'tracker> Builder<'tracker> {
         match element {
             DisplayElement::Text { params } => {
                 let font = self.font_tracker.font_id(params);
+                self.outlining = self.font_tracker.is_outlined(font);
+                if self.outlining {
+                    flush_text_batch(text_batch, self.font_tracker, &mut self.buf, &mut self.gs);
+                    text_batch.clear();
+                    *batch_font = None;
+                    return;
+                }
                 if *batch_font == Some(font) {
                     text_batch.push(params);
                 } else {
@@ -517,12 +528,12 @@ impl<'tracker> Builder<'tracker> {
             // the BT/ET blocks of PostScript text that is re-emitted.
             DisplayElement::TextRun { .. } => return,
             DisplayElement::Fill { params, .. }
-                if params.is_text_glyph && self.has_text_elements =>
+                if params.is_text_glyph && self.has_text_elements && !self.outlining =>
             {
                 return;
             }
             DisplayElement::Stroke { params, .. }
-                if params.is_text_glyph && self.has_text_elements =>
+                if params.is_text_glyph && self.has_text_elements && !self.outlining =>
             {
                 return;
             }
@@ -547,7 +558,7 @@ impl<'tracker> Builder<'tracker> {
                 self.gs.fill_color = Some(PdfColor::Gray(10000));
             }
             DisplayElement::Fill { path, params } => {
-                if params.is_text_glyph && self.has_text_elements {
+                if params.is_text_glyph && self.has_text_elements && !self.outlining {
                     return;
                 }
                 emit_transfer(
@@ -628,7 +639,7 @@ impl<'tracker> Builder<'tracker> {
                 }
             }
             DisplayElement::Stroke { path, params } => {
-                if params.is_text_glyph && self.has_text_elements {
+                if params.is_text_glyph && self.has_text_elements && !self.outlining {
                     return;
                 }
                 let has_ctm = !is_identity(&params.ctm);
@@ -1365,6 +1376,9 @@ fn stream_fonts(list: &DisplayList, font_tracker: &FontTracker) -> (bool, HashSe
     let mut names = HashSet::new();
     visit_text(list, false, &mut |params| {
         has_text = true;
+        if font_tracker.is_outlined(font_tracker.font_id(params)) {
+            return;
+        }
         let name = font_tracker.get_pdf_name(font_tracker.font_id(params));
         debug_assert!(name.is_some(), "text in an untracked font");
         names.extend(name.map(str::to_string));
