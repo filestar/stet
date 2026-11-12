@@ -498,7 +498,7 @@ impl SkiaDevice {
             // wrong, which is what a page that size was always going to do,
             // rather than taking the process down.
             let Some(pixmap) = Pixmap::new(self.page_w, self.page_h) else {
-                eprintln!(
+                stet_fonts::diag!(
                     "Warning: could not allocate a {}x{} page pixmap; \
                      rendering into the existing {}x{} buffer instead",
                     self.page_w,
@@ -15130,7 +15130,7 @@ pub fn render_to_rgba_with_background(
         page_background,
         layer_set,
     ) {
-        eprintln!("render_to_rgba: banded render failed: {e}");
+        stet_fonts::diag!("render_to_rgba: banded render failed: {e}");
         return blank(pixel_w, pixel_h);
     }
 

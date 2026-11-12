@@ -868,7 +868,7 @@ pub fn op_showpage(ctx: &mut Context) -> Result<(), PsError> {
         if let Some(continue_op) = ctx.dict_load(&stet_core::dict::DictKey::Name(continue_name)) {
             ctx.e_stack.push(continue_op)?;
         } else {
-            eprintln!("Warning: .showpage_continue not found in dict stack");
+            stet_fonts::diag!("Warning: .showpage_continue not found in dict stack");
         }
         ctx.e_stack.push(end_page)?;
         return Ok(());

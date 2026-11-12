@@ -77,7 +77,7 @@ pub(crate) fn build(
     let font = match prepare(fonts, cidfont, &usage.used_codes) {
         Ok(font) => font,
         Err(e) => {
-            eprintln!(
+            stet_fonts::diag!(
                 "[font_embedder] CIDFontType 0 {}: {e}",
                 String::from_utf8_lossy(&usage.font_name)
             );
@@ -87,7 +87,7 @@ pub(crate) fn build(
     let cff = match cff_writer::write_cid_font(&font.cff) {
         Ok(cff) => cff,
         Err(e) => {
-            eprintln!(
+            stet_fonts::diag!(
                 "[font_embedder] CIDFontType 0 {}: {e}",
                 String::from_utf8_lossy(&usage.font_name)
             );

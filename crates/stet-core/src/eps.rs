@@ -38,61 +38,88 @@ pub fn content_is_epsf(data: &[u8]) -> bool {
     first_line.windows(4).any(|w| w == b"EPSF")
 }
 
-/// Parse a `%%BoundingBox` or `%%HiResBoundingBox` DSC comment from EPS data.
+/// How far into the file the header comments are looked for. Illustrator and
+/// QuarkXPress write header comments well past 4 KB (long `%%DocumentFonts`
+/// and `%%+` continuation lists).
+const HEADER_MAX: usize = 64 * 1024;
+
+/// How far from the end a `(atend)` box is looked for.
+const TRAILER_MAX: usize = 4096;
+
+/// Parse the `%%BoundingBox` and `%%HiResBoundingBox` DSC comments of EPS data.
 ///
-/// Scans the first 4096 bytes for the bounding box comment. Prefers
-/// `%%HiResBoundingBox` (float values) over `%%BoundingBox` (integer values).
-/// Handles `%%BoundingBox: (atend)` by also scanning the last 4096 bytes.
+/// Read as DSC 3.0 says: from the header, the comment lines after the first
+/// line up to `%%EndComments` or the first line that is not a comment (within
+/// the first 64 KB), and the first of each comment there counts. A box after
+/// the header belongs to something else, such as an EPS embedded between
+/// `%%BeginDocument` and `%%EndDocument`. `(atend)` defers to the last such
+/// comment in the trailer (the last 4 KB).
+///
+/// The HiRes box is preferred when it is finite and has an area; otherwise the
+/// integer box is returned (which may itself have no area: callers check).
 ///
 /// Returns `Some((llx, lly, urx, ury))` or `None` if not found.
 pub fn read_eps_bounding_box(data: &[u8]) -> Option<(f64, f64, f64, f64)> {
-    // Scan the header portion first
-    let header_end = data.len().min(4096);
-    let header = &data[..header_end];
-
-    let mut bbox = None;
-    let mut hires_bbox = None;
-    let mut need_atend = false;
-
-    scan_for_bbox(header, &mut bbox, &mut hires_bbox, &mut need_atend);
-
-    // If %%BoundingBox: (atend), scan the trailer too
-    if need_atend && data.len() > 4096 {
-        let trailer_start = data.len().saturating_sub(4096);
-        let trailer = &data[trailer_start..];
-        scan_for_bbox(trailer, &mut bbox, &mut hires_bbox, &mut need_atend);
+    let head = &data[..data.len().min(HEADER_MAX)];
+    let mut bbox = Found::Missing;
+    let mut hires = Found::Missing;
+    for line in head.split(is_eol).skip(1).filter(|l| !l.is_empty()) {
+        if line.starts_with(b"%%EndComments") || !line.starts_with(b"%") {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix(b"%%HiResBoundingBox:") {
+            hires.first(rest);
+        } else if let Some(rest) = line.strip_prefix(b"%%BoundingBox:") {
+            bbox.first(rest);
+        }
     }
 
-    hires_bbox.or(bbox)
+    let trailer = &data[data.len().saturating_sub(TRAILER_MAX)..];
+    let bbox = bbox.resolve(trailer, b"%%BoundingBox:");
+    let hires = hires.resolve(trailer, b"%%HiResBoundingBox:");
+    hires.filter(|b| has_area(*b)).or(bbox)
 }
 
-/// Scan a byte slice for BoundingBox and HiResBoundingBox comments.
-fn scan_for_bbox(
-    data: &[u8],
-    bbox: &mut Option<(f64, f64, f64, f64)>,
-    hires_bbox: &mut Option<(f64, f64, f64, f64)>,
-    need_atend: &mut bool,
-) {
-    for line in data.split(|&b| b == b'\n' || b == b'\r') {
-        if line.is_empty() {
-            continue;
-        }
+/// One box comment as the header gives it.
+enum Found {
+    Missing,
+    AtEnd,
+    Box(Option<(f64, f64, f64, f64)>),
+}
 
-        if line.starts_with(b"%%HiResBoundingBox:") {
-            let rest = &line[b"%%HiResBoundingBox:".len()..];
-            if let Some(values) = parse_four_numbers(rest) {
-                *hires_bbox = Some(values);
-            }
-        } else if line.starts_with(b"%%BoundingBox:") {
-            let rest = &line[b"%%BoundingBox:".len()..];
-            let trimmed = trim_ascii(rest);
-            if trimmed == b"(atend)" {
-                *need_atend = true;
-            } else if let Some(values) = parse_four_numbers(rest) {
-                *bbox = Some(values);
-            }
+impl Found {
+    /// The header's first comment counts: a later one changes nothing.
+    fn first(&mut self, rest: &[u8]) {
+        if matches!(self, Found::Missing) {
+            *self = if trim_ascii(rest) == b"(atend)" {
+                Found::AtEnd
+            } else {
+                Found::Box(parse_four_numbers(rest))
+            };
         }
     }
+
+    /// The box, with `(atend)` taken from the last such comment in the trailer.
+    fn resolve(self, trailer: &[u8], key: &[u8]) -> Option<(f64, f64, f64, f64)> {
+        match self {
+            Found::Missing => None,
+            Found::Box(b) => b,
+            // From the end: the last one counts.
+            Found::AtEnd => trailer
+                .rsplit(is_eol)
+                .filter_map(|l| l.strip_prefix(key))
+                .filter(|r| trim_ascii(r) != b"(atend)")
+                .find_map(parse_four_numbers),
+        }
+    }
+}
+
+fn is_eol(b: &u8) -> bool {
+    *b == b'\n' || *b == b'\r'
+}
+
+fn has_area(b: (f64, f64, f64, f64)) -> bool {
+    b.2 > b.0 && b.3 > b.1
 }
 
 /// Parse four whitespace-separated numbers from a byte slice.
@@ -103,7 +130,10 @@ fn parse_four_numbers(data: &[u8]) -> Option<(f64, f64, f64, f64)> {
     let lly = nums.next()?;
     let urx = nums.next()?;
     let ury = nums.next()?;
-    Some((llx, lly, urx, ury))
+    [llx, lly, urx, ury]
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some((llx, lly, urx, ury))
 }
 
 /// Trim leading and trailing ASCII whitespace from a byte slice.
@@ -210,5 +240,47 @@ mod tests {
 
         let bbox = read_eps_bounding_box(&data);
         assert_eq!(bbox, Some((10.0, 20.0, 300.0, 400.0)));
+    }
+
+    #[test]
+    fn test_bbox_first_in_header_counts() {
+        let data = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 300 200\n%%BoundingBox: 0 0 50 50\n%%EndComments\n";
+        assert_eq!(read_eps_bounding_box(data), Some((0.0, 0.0, 300.0, 200.0)));
+    }
+
+    #[test]
+    fn test_bbox_after_the_header_is_not_the_files() {
+        // An embedded EPS's box, after %%EndComments.
+        let data = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 300 200\n%%EndComments\n\
+                     %%BeginDocument: x.eps\n%%BoundingBox: 0 0 40 40\n%%EndDocument\n";
+        assert_eq!(read_eps_bounding_box(data), Some((0.0, 0.0, 300.0, 200.0)));
+        // The header also ends at the first line that is not a comment.
+        let data = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 300 200\n/x 1 def\n%%BoundingBox: 0 0 40 40\n";
+        assert_eq!(read_eps_bounding_box(data), Some((0.0, 0.0, 300.0, 200.0)));
+    }
+
+    #[test]
+    fn test_bbox_hires_without_area_is_not_preferred() {
+        let data =
+            b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 300 200\n%%HiResBoundingBox: 0 0 0 0\n";
+        assert_eq!(read_eps_bounding_box(data), Some((0.0, 0.0, 300.0, 200.0)));
+    }
+
+    #[test]
+    fn test_bbox_in_a_long_header() {
+        // Illustrator's font lists run past 4 KB before the box.
+        let mut data = b"%!PS-Adobe-3.0 EPSF-3.0\n%%DocumentFonts: A\n".to_vec();
+        for _ in 0..600 {
+            data.extend_from_slice(b"%%+ SomeFontName\n");
+        }
+        data.extend_from_slice(b"%%BoundingBox: 0 0 300 200\n%%EndComments\n");
+        assert!(data.len() > 4096);
+        assert_eq!(read_eps_bounding_box(&data), Some((0.0, 0.0, 300.0, 200.0)));
+    }
+
+    #[test]
+    fn test_bbox_not_finite_is_ignored() {
+        let data = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1e400 200\n";
+        assert_eq!(read_eps_bounding_box(data), None);
     }
 }

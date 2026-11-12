@@ -127,7 +127,7 @@ fn clamp_page_size(ctx: &Context, width: f64, height: f64) -> (f64, f64) {
     let w = clamp_one(width, 612.0);
     let h = clamp_one(height, 792.0);
     if w != width || h != height {
-        eprintln!(
+        stet_fonts::diag!(
             "Warning: PageSize [{width} {height}] is outside the supported range; \
              using [{w} {h}] (limit {limit} pt per side)"
         );
@@ -488,7 +488,7 @@ pub(crate) fn transmit_page_without_end_page(ctx: &mut Context) {
             let device = ctx.device.as_mut().unwrap();
             let path = ctx.output_path.as_ref().unwrap();
             if let Err(e) = device.replay_and_show(list, path) {
-                eprintln!("showpage error: {}", e);
+                stet_fonts::diag!("showpage error: {}", e);
             }
         } else {
             let device = ctx.device.as_mut().unwrap();
@@ -612,7 +612,7 @@ fn transmit_page(ctx: &mut Context, operator: &str) -> Result<(), PsError> {
         if let Some(ref mut device) = ctx.device
             && let Err(e) = device.replay_and_show(list, &path)
         {
-            eprintln!("{operator} error: {e}");
+            stet_fonts::diag!("{operator} error: {e}");
         }
     } else {
         ctx.display_list.clear();
