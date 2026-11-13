@@ -308,14 +308,17 @@ impl Interpreter {
         let ps_data = strip_dos_eps_header(ps_data);
         let is_eps = content_is_epsf(ps_data);
 
-        let (page_w, page_h) = if is_eps {
-            if let Some((llx, lly, urx, ury)) = read_eps_bounding_box(ps_data) {
-                (urx - llx, ury - lly)
-            } else {
-                self.default_page
-            }
+        // As `render_to_display_list`: an EPS box without an area gives the
+        // default page and no translation, so both outputs place the drawing
+        // alike.
+        let eps_box = if is_eps {
+            read_eps_bounding_box(ps_data).filter(|(llx, lly, urx, ury)| urx > llx && ury > lly)
         } else {
-            self.default_page
+            None
+        };
+        let (page_w, page_h) = match eps_box {
+            Some((llx, lly, urx, ury)) => (urx - llx, ury - lly),
+            None => self.default_page,
         };
 
         // Set up PdfDevice as the device factory
@@ -340,7 +343,6 @@ impl Interpreter {
         stet_ops::register_pdf_authoring_ops(&mut self.ctx);
 
         self.last_error = None;
-        let eps_box = if is_eps { read_eps_bounding_box(ps_data) } else { None };
         let exec_result = if let Some((llx, lly, _, _)) = eps_box {
             self.exec_eps(ps_data, llx, lly)
         } else {

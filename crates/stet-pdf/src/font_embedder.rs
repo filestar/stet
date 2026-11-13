@@ -908,7 +908,7 @@ pub fn build_font_resource(
         _ => None,
     };
     if result.is_none() {
-        eprintln!(
+        stet_fonts::diag!(
             "[font_embedder] FAILED type={} name={} font={:?} codes={}",
             usage.font_type,
             String::from_utf8_lossy(&usage.font_name),
@@ -1815,12 +1815,15 @@ fn type42_program(fonts: &FontData, usage: &FontUsage) -> Option<Vec<u8>> {
 fn type42_gid(fonts: &FontData, usage: &FontUsage, code: u16) -> Option<u16> {
     let notdef = fonts.find(b".notdef");
     let instances = || usage.all_fonts.iter().rev();
-    let name = instances().find_map(|f| {
-        glyph_at(encoding_of(fonts, f)?, code).filter(|&n| Some(n) != notdef)
-    })?;
+    let name = instances()
+        .find_map(|f| glyph_at(encoding_of(fonts, f)?, code).filter(|&n| Some(n) != notdef))?;
     instances()
         .chain(usage.program_fonts.iter().rev())
-        .find_map(|f| dict_of(fonts, f, b"CharStrings")?.get_name(name).and_then(Frozen::as_i32))
+        .find_map(|f| {
+            dict_of(fonts, f, b"CharStrings")?
+                .get_name(name)
+                .and_then(Frozen::as_i32)
+        })
         .and_then(|gid| u16::try_from(gid).ok())
 }
 

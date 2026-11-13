@@ -65,6 +65,7 @@ pub mod cff_writer;
 pub mod charstring;
 pub mod cid_type0;
 pub mod cid_unicode;
+pub mod diag;
 pub mod encoding;
 pub mod geometry;
 pub mod host;
