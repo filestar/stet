@@ -345,7 +345,7 @@ fn emit_tm(buf: &mut Vec<u8>, a: f64, b: f64, c: f64, d: f64, tx: f64, ty: f64) 
 }
 
 /// Emit a fill color for text (lowercase operators: g, rg, k).
-fn emit_text_color(buf: &mut Vec<u8>, params: &TextParams) {
+pub(crate) fn emit_text_color(buf: &mut Vec<u8>, params: &TextParams) {
     let c = &params.color;
     if let Some((c_val, m, y, k)) = c.native_cmyk {
         fmt_num(buf, c_val);

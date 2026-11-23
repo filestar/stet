@@ -17,7 +17,7 @@ use stet_fonts::geometry::{Matrix, PathSegment, PsPath};
 use stet_fonts::truetype;
 use stet_fonts::type2_charstring;
 use stet_graphics::color::{DashPattern, FillRule, LineCap, LineJoin};
-use stet_graphics::device::{FillParams, StrokeParams, TextParams};
+use stet_graphics::device::{FillParams, StrokeParams, TextParams, Type3Glyph};
 use stet_graphics::display_list::DisplayElement;
 
 use crate::text_record;
@@ -3647,6 +3647,7 @@ fn replay_cached_type3(
     Type3Metrics {
         width: cg.width,
         bbox: cg.bbox,
+        stencil: true,
     }
 }
 
@@ -3656,6 +3657,8 @@ struct Type3Metrics {
     width: (f64, f64),
     /// The bounding box from `setcachedevice`; `None` after `setcharwidth`.
     bbox: Option<[f64; 4]>,
+    /// Built with `setcachedevice`: a stencil in the current colour.
+    stencil: bool,
 }
 
 /// Run one Type 3 glyph's build procedure at `(cur_x, cur_y)` in user space.
@@ -3758,7 +3761,8 @@ fn build_type3_glyph(
     };
 
     // Cache if setcachedevice was called (not setcharwidth)
-    if ctx.char_cache_mode == Some(Type3CacheMode::Cache) {
+    let stencil = ctx.char_cache_mode == Some(Type3CacheMode::Cache);
+    if stencil {
         let elements: Vec<DisplayElement> = match &drained {
             Some(elements) => elements.clone(),
             None => ctx.current_display_list().elements_from(dl_start).to_vec(),
@@ -3780,7 +3784,64 @@ fn build_type3_glyph(
     Ok(Type3Metrics {
         width: char_width,
         bbox,
+        stencil,
     })
+}
+
+/// Keep a Type 3 glyph as text for a device that writes text (PDF output):
+/// put a `Text` element for it in front of the marks its glyph procedure
+/// made, which run from `marks_start` to the end of the display list.
+///
+/// The marks stay where they are, so every other device draws them as
+/// before. The `Text` says how many there are and how glyph space maps to
+/// device space ([`Type3Glyph`]); the PDF writer turns them back into the
+/// glyph's procedure in a PDF Type 3 font, and draws them as they are
+/// where it cannot. A glyph that draws nothing, such as a space, still
+/// gets its `Text`, which keeps the gap between words in the text.
+#[expect(clippy::too_many_arguments)]
+fn mark_type3_text(
+    ctx: &mut Context,
+    font_entity: EntityId,
+    code: u8,
+    glyph_name: Option<stet_core::object::NameId>,
+    origin: (f64, f64),
+    ctm: &Matrix,
+    metrics: &Type3Metrics,
+    marks_start: usize,
+) {
+    if ctx.null_device_active() || !ctx.device.as_ref().is_some_and(|d| d.keeps_text_fonts()) {
+        return;
+    }
+    let marks_end = ctx.current_display_list().len();
+    if marks_end < marks_start {
+        return;
+    }
+    // The FontMatrix the procedure ran under, re-read as `build_type3_glyph`
+    // does.
+    let font_matrix = read_font_matrix(ctx, font_entity);
+    let glyph_to_device = ctm
+        .multiply(&Matrix::translate(origin.0, origin.1))
+        .multiply(&font_matrix);
+    let device_origin = ctm.transform_point(origin.0, origin.1);
+    let Some(mut params) = text_params(ctx, vec![code], font_entity, 3, Some(device_origin), None)
+    else {
+        return;
+    };
+    params.type3 = Some(Box::new(Type3Glyph::new(
+        glyph_to_device,
+        font_matrix,
+        metrics.width,
+        metrics.bbox,
+        metrics.stencil,
+        glyph_name.map(|id| ctx.names.get_bytes(id).to_vec()),
+        marks_end - marks_start,
+    )));
+    let list = ctx.current_display_list_mut();
+    let marks = list.split_off(marks_start);
+    list.push(DisplayElement::Text { params });
+    for mark in marks.into_elements() {
+        list.push(mark);
+    }
 }
 
 /// Run a Type 3 font's BuildChar/BuildGlyph procedure over `bytes`.
@@ -3839,6 +3900,7 @@ fn render_show_type3(
     // Render each character synchronously
     for &byte in bytes {
         let key = Type3CacheKey::Code(byte);
+        let marks_start = ctx.current_display_list().len();
         let metrics = match type3_cache_get(ctx, font_entity, key) {
             Some(cg) => replay_cached_type3(ctx, &cg, cur_x, cur_y, &ctm, charpath),
             None => {
@@ -3858,6 +3920,19 @@ fn render_show_type3(
             }
         };
 
+        if !charpath {
+            let name = encoding_name_for_code(ctx, font_entity, byte);
+            mark_type3_text(
+                ctx,
+                font_entity,
+                byte,
+                name,
+                (cur_x, cur_y),
+                &ctm,
+                &metrics,
+                marks_start,
+            );
+        }
         let (wx, wy) = font_matrix.transform_delta(metrics.width.0, metrics.width.1);
         if !charpath && ctx.text_capture.is_some() {
             let text = match encoding_name_for_code(ctx, font_entity, byte) {
@@ -3937,6 +4012,7 @@ fn glyphshow_type3(
     let (cur_x, cur_y) = ictm.transform_point(dev_cpx, dev_cpy);
     let ctm = ctx.gstate.ctm;
 
+    let marks_start = ctx.current_display_list().len();
     let metrics = match type3_cache_get(ctx, font_entity, key) {
         Some(cg) => replay_cached_type3(ctx, &cg, cur_x, cur_y, &ctm, false),
         None => build_type3_glyph(
@@ -3952,6 +4028,25 @@ fn glyphshow_type3(
             false,
         )?,
     };
+    // As text only where a code shows this glyph: a PDF font reaches its
+    // glyphs through codes.
+    let code = match key {
+        Type3CacheKey::Code(code) => Some(code),
+        Type3CacheKey::Name(name) => encoding_code_for_name(ctx, font_entity, name),
+    };
+    if let Some(code) = code {
+        let name = encoding_name_for_code(ctx, font_entity, code);
+        mark_type3_text(
+            ctx,
+            font_entity,
+            code,
+            name,
+            (cur_x, cur_y),
+            &ctm,
+            &metrics,
+            marks_start,
+        );
+    }
 
     let (wx, wy) = font_matrix.transform_delta(metrics.width.0, metrics.width.1);
     record_glyphshow(
@@ -5713,6 +5808,23 @@ fn emit_text_element_with_fm(
     device_pos: Option<(f64, f64)>,
     override_fm: Option<Matrix>,
 ) {
+    if let Some(params) = text_params(ctx, text, font_entity, font_type, device_pos, override_fm) {
+        ctx.current_display_list_mut()
+            .push(DisplayElement::Text { params });
+    }
+}
+
+/// The `Text` element for `text` shown in `font_entity` at `device_pos` (the
+/// current point when `None`), or `None` when the text is painted with a
+/// pattern; see [`emit_text_element_with_fm`].
+fn text_params(
+    ctx: &mut Context,
+    text: Vec<u8>,
+    font_entity: EntityId,
+    font_type: i32,
+    device_pos: Option<(f64, f64)>,
+    override_fm: Option<Matrix>,
+) -> Option<TextParams> {
     // Extract FontName — for Type 0, try CIDFont descendant's name
     let font_name = get_font_name_for_text(ctx, font_entity, font_type);
 
@@ -5757,16 +5869,15 @@ fn emit_text_element_with_fm(
     // colour under the pattern, showing through wherever the pattern leaves
     // gaps.
     if paint_type != 2 && ctx.gstate.current_pattern.is_some() {
-        return;
+        return None;
     }
 
     // A device that reads the font after the page is sent (PDF output) gets
-    // a copy taken before any `restore` can reclaim or revert it.
-    let font_snapshot = ctx
-        .device
-        .as_ref()
-        .is_some_and(|d| d.keeps_text_fonts())
-        .then(|| ctx.font_snapshots.note_shown(font_entity));
+    // a copy taken before any `restore` can reclaim or revert it. A Type 3
+    // glyph carries what it draws instead (`TextParams::type3`).
+    let font_snapshot = (font_type != 3
+        && ctx.device.as_ref().is_some_and(|d| d.keeps_text_fonts()))
+    .then(|| ctx.font_snapshots.note_shown(font_entity));
 
     let params = TextParams {
         text,
@@ -5793,9 +5904,9 @@ fn emit_text_element_with_fm(
         blend_mode: ctx.gstate.blend_mode,
         alpha_is_shape: ctx.gstate.alpha_is_shape,
         text_knockout: ctx.gstate.text_knockout,
+        type3: None,
     };
-    ctx.current_display_list_mut()
-        .push(DisplayElement::Text { params });
+    Some(params)
 }
 
 fn push_glyph_element(
@@ -6091,6 +6202,10 @@ fn recolor_and_translate_element(
             params.start_y += dy;
             params.ctm[4] += dx;
             params.ctm[5] += dy;
+            if let Some(t3) = params.type3.as_mut() {
+                t3.glyph_to_device.tx += dx;
+                t3.glyph_to_device.ty += dy;
+            }
             DisplayElement::Text { params }
         }
         // Positioned like the glyph it was cached with; the text is not

@@ -399,6 +399,10 @@ struct Builder<'tracker> {
     /// mask). The Form is invoked under the page's initial `cm`, so its
     /// space — the one its patterns' matrices map to — is device space.
     in_form: bool,
+    /// The PDF Type 3 font of the open `BT` block of Type 3 glyphs.
+    type3_open: Option<String>,
+    /// The colour operator last set in that block.
+    type3_color: Option<Vec<u8>>,
     font_tracker: &'tracker mut FontTracker,
 }
 
@@ -476,6 +480,8 @@ impl<'tracker> Builder<'tracker> {
             page_h,
             in_tile,
             in_form: false,
+            type3_open: None,
+            type3_color: None,
             font_tracker,
         }
     }
@@ -485,10 +491,80 @@ impl<'tracker> Builder<'tracker> {
     fn emit_list<'a>(&mut self, list: &'a DisplayList) {
         let mut text_batch: Vec<&'a TextParams> = Vec::new();
         let mut batch_font: Option<FontId> = None;
-        for element in list.elements() {
-            self.emit_element(element, &mut text_batch, &mut batch_font);
+        let elements = list.elements();
+        let mut i = 0;
+        while i < elements.len() {
+            // A Type 3 glyph: its `Text`, then the marks that draw it.
+            if let DisplayElement::Text { params } = &elements[i]
+                && params.font_type == 3
+            {
+                let marks = params
+                    .type3
+                    .as_ref()
+                    .map_or(0, |t3| t3.elements.min(elements.len() - i - 1));
+                let placed = match &params.type3 {
+                    Some(t3) if !self.in_tile => self
+                        .font_tracker
+                        .type3
+                        .place(params, t3, &elements[i + 1..i + 1 + marks])
+                        .map(|p| (p.pdf_name.to_string(), p.text_matrix)),
+                    _ => None,
+                };
+                let kept = placed.is_some();
+                if let Some((name, tm)) = placed {
+                    flush_text_batch(&text_batch, self.font_tracker, &mut self.buf, &mut self.gs);
+                    text_batch.clear();
+                    batch_font = None;
+                    self.emit_type3_text(params, name, &tm);
+                }
+                // Kept: the marks are the glyph's procedure now. Else they
+                // are drawn as they are, after a `Text` that writes nothing.
+                i += if kept { 1 + marks } else { 1 };
+                continue;
+            }
+            self.close_type3_text();
+            self.emit_element(&elements[i], &mut text_batch, &mut batch_font);
+            i += 1;
         }
+        self.close_type3_text();
         flush_text_batch(&text_batch, self.font_tracker, &mut self.buf, &mut self.gs);
+    }
+
+    /// Show one Type 3 glyph in its PDF Type 3 font, `tm` placing the
+    /// font's text space on the device. Consecutive glyphs share a `BT`
+    /// block, which [`close_type3_text`](Self::close_type3_text) ends.
+    fn emit_type3_text(&mut self, params: &TextParams, pdf_name: String, tm: &Matrix) {
+        if self.type3_open.as_deref() != Some(pdf_name.as_str()) {
+            self.close_type3_text();
+            // A stroked font's batch may have left the render mode at 1.
+            let _ = write!(self.buf, "BT\n0 Tr\n/{pdf_name} 1 Tf\n");
+            self.page_font_names.insert(pdf_name.clone());
+            self.type3_open = Some(pdf_name);
+            self.type3_color = None;
+        }
+        // The text's colour: a stencil glyph (`d1`) is painted in it, and a
+        // glyph with colours of its own ignores it.
+        let mut color = Vec::new();
+        text_ops::emit_text_color(&mut color, params);
+        if self.type3_color.as_ref() != Some(&color) {
+            self.buf.extend(&color);
+            self.type3_color = Some(color);
+        }
+        emit_matrix(&mut self.buf, tm);
+        let _ = writeln!(self.buf, " Tm\n<{:02X}> Tj", params.text[0]);
+    }
+
+    /// End the `BT` block of Type 3 glyphs, if one is open.
+    fn close_type3_text(&mut self) {
+        if self.type3_open.take().is_some() {
+            self.buf.extend(b"ET\n");
+            self.type3_color = None;
+            // The text's colour operators changed the current colour.
+            self.gs.fill_color = None;
+            self.gs.fill_cs_name = None;
+            self.gs.stroke_color = None;
+            self.gs.stroke_cs_name = None;
+        }
     }
 
     fn emit_element<'a>(
@@ -1349,6 +1425,8 @@ fn emit_group_composite_gs(
 fn visit_text<'a>(list: &'a DisplayList, tiles: bool, f: &mut dyn FnMut(&'a TextParams)) {
     for element in list.elements() {
         match element {
+            // A Type 3 glyph is in a PDF Type 3 font of its own, or drawn.
+            DisplayElement::Text { params } if params.font_type == 3 => {}
             DisplayElement::Text { params } => f(params),
             DisplayElement::Group { elements, .. } | DisplayElement::OcgGroup { elements, .. } => {
                 visit_text(elements, tiles, f)
@@ -2125,7 +2203,7 @@ fn paths_equal(a: &PsPath, b: &PsPath) -> bool {
 }
 
 /// Emit path segments as PDF path operators.
-fn emit_path(buf: &mut Vec<u8>, path: &PsPath) {
+pub(crate) fn emit_path(buf: &mut Vec<u8>, path: &PsPath) {
     use stet_fonts::geometry::PathSegment;
     for seg in &path.segments {
         match seg {
@@ -2173,7 +2251,7 @@ fn emit_path(buf: &mut Vec<u8>, path: &PsPath) {
 ///
 /// Maps the unit square (0,0)-(1,0)-(0,1) to the image rectangle in device space.
 /// The content stream's base CTM then maps device space to PDF space.
-fn compute_image_matrix(params: &stet_graphics::device::ImageParams) -> Matrix {
+pub(crate) fn compute_image_matrix(params: &stet_graphics::device::ImageParams) -> Matrix {
     // image_matrix maps user space → image pixel space (PostScript convention)
     // Its inverse maps image pixels → user space
     // CTM maps user space → device space
@@ -2220,7 +2298,7 @@ fn emit_cm(buf: &mut Vec<u8>, m: &Matrix) {
 }
 
 /// Check if a matrix is (approximately) identity.
-fn is_identity(m: &Matrix) -> bool {
+pub(crate) fn is_identity(m: &Matrix) -> bool {
     (m.a - 1.0).abs() < 1e-10
         && m.b.abs() < 1e-10
         && m.c.abs() < 1e-10

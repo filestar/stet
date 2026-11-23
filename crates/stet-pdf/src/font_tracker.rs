@@ -127,6 +127,9 @@ pub struct FontTracker {
     /// Embed the Standard 14 fonts too, as any other font, rather than
     /// naming them for the viewer to supply.
     embed_standard_14: bool,
+    /// The PDF Type 3 fonts PostScript Type 3 text is kept in, filled while
+    /// the content streams are built.
+    pub type3: crate::type3::Type3Fonts,
 }
 
 impl FontTracker {
@@ -137,6 +140,7 @@ impl FontTracker {
             instance_to_font: HashMap::new(),
             snapshot_ids: HashMap::new(),
             embed_standard_14: false,
+            type3: crate::type3::Type3Fonts::default(),
         }
     }
 
