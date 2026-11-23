@@ -66,6 +66,42 @@
 //!
 //! See [`diagnostics`] for the warning types.
 //!
+//! # Untrusted Documents
+//!
+//! PostScript is a programming language with file access: by default a
+//! program can read, write, delete and rename files with `file`, `run`,
+//! `deletefile` and `renamefile`, as it can in Ghostscript with
+//! `-dNOSAFER`. There are two ways to restrict that.
+//!
+//! **[`InterpreterBuilder::safer`]** is Ghostscript's `-dSAFER`, for one
+//! interpreter. Programs reach stet's own resources and installed fonts,
+//! and only what [`Interpreter::permit_read`],
+//! [`permit_write`](Interpreter::permit_write) and
+//! [`permit_control`](Interpreter::permit_control) allow; any other file
+//! is `invalidfileaccess`, whether or not it exists. Fonts, CMaps and
+//! color profiles stet finds itself are read as before, so pages render
+//! the same.
+//!
+//! ```no_run
+//! let mut interp = stet::Interpreter::builder().safer().build();
+//! interp.permit_read("prologs")?; // a folder of the job's own files
+//! let result = interp.render(b"(/etc/passwd) (r) file", 72.0);
+//! assert!(result.is_err()); // invalidfileaccess
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! **[`deny_host_access`]** goes further, for the whole process: called
+//! once, before the first document, it keeps every document, PostScript or
+//! PDF, from the machine's files, installed fonts and color profiles, so
+//! output is the same on every machine. No permit lifts it.
+//!
+//! Either limits what a document can reach, not how long it runs or how much
+//! memory it takes. For those, set [`PsContext::set_timeout`] before each
+//! job and [`PsContext::max_local_vm`], through [`Interpreter::context`].
+//! The page a PostScript file may declare is bounded already, at 14400 pt
+//! (200 inches) a side; [`InterpreterBuilder::max_page_size`] raises that
+//! for large-format artwork.
+//!
 //! # Feature Flags
 //!
 //! Both features are enabled by default. Use `default-features = false` for
@@ -85,7 +121,6 @@ mod init;
 use std::sync::{Arc, Mutex};
 
 use stet_core::context::Context;
-#[cfg(any(feature = "render", feature = "pdf-output"))]
 use stet_core::device::OutputDevice;
 use stet_core::eps::{content_is_epsf, read_eps_bounding_box, strip_dos_eps_header};
 use stet_core::error::PsError;
@@ -97,7 +132,9 @@ pub use diagnostics::{ExecWarning, ExecWarningKind};
 
 // Re-exports for power users
 pub use stet_core::context::Context as PsContext;
+pub use stet_core::file_access::{Access, FileAccess};
 pub use stet_engine::eval::parse_and_exec as ps_exec;
+pub use stet_fonts::host::{deny_host_access, host_access_allowed};
 pub use stet_graphics::device::{ShownGlyph, TextExtraction, TextRunParams, UnicodeSource};
 pub use stet_graphics::display_list::{DisplayElement, DisplayList as PsDisplayList};
 pub use stet_graphics::icc::IccCache;
@@ -177,9 +214,10 @@ pub struct InterpreterBuilder {
     keep_partial: bool,
     text_extraction: TextExtraction,
     default_rendering_intent: RenderingIntent,
+    file_access: FileAccess,
     max_page_size_points: f64,
-    keep_jpeg: bool,
     default_page: (f64, f64),
+    keep_jpeg: bool,
     embed_standard_fonts: bool,
     #[cfg(feature = "render")]
     page_background: PageBackground,
@@ -202,9 +240,10 @@ impl Interpreter {
             keep_partial: false,
             text_extraction: TextExtraction::Off,
             default_rendering_intent: RenderingIntent::RelativeColorimetric,
+            file_access: FileAccess::Full,
             max_page_size_points: stet_core::context::DEFAULT_MAX_PAGE_SIZE_POINTS,
-            keep_jpeg: false,
             default_page: (612.0, 792.0),
+            keep_jpeg: false,
             embed_standard_fonts: false,
             #[cfg(feature = "render")]
             page_background: PageBackground::White,
@@ -279,6 +318,7 @@ impl Interpreter {
         dpi: f64,
     ) -> Result<Vec<DisplayListPage>, StetError> {
         self.warnings.clear();
+        self.last_error = None;
         let ps_data = strip_dos_eps_header(ps_data);
         let is_eps = content_is_epsf(ps_data);
 
@@ -304,6 +344,7 @@ impl Interpreter {
     #[cfg(feature = "pdf-output")]
     pub fn render_to_pdf(&mut self, ps_data: &[u8], dpi: f64) -> Result<Vec<u8>, StetError> {
         self.warnings.clear();
+        self.last_error = None;
         self.ctx.null_device_used = false;
         let ps_data = strip_dos_eps_header(ps_data);
         let is_eps = content_is_epsf(ps_data);
@@ -342,34 +383,13 @@ impl Interpreter {
         // same prologue takes its CMYK→ICC branch instead.
         stet_ops::register_pdf_authoring_ops(&mut self.ctx);
 
-        self.last_error = None;
         let exec_result = if let Some((llx, lly, _, _)) = eps_box {
             self.exec_eps(ps_data, llx, lly)
         } else {
             let result = parse_and_exec(&mut self.ctx, ps_data);
-            let result = job_result(&self.ctx, result);
-            // As `render_ps`: the pages shown before an error, and the one
-            // being painted, are kept when the caller asked for them.
-            match result {
-                Err(e) if self.keep_partial => {
-                    self.flush_partial_page();
-                    Err(e)
-                }
-                r => r,
-            }
+            job_result(&self.ctx, result)
         };
-        let exec_result = match exec_result {
-            Ok(()) => self.end_page_device(),
-            Err(e) => Err(e),
-        };
-        let exec_result = exec_result.map_err(|e| self.named_error(e));
-        let exec_result = match exec_result {
-            Err(e) if self.keep_partial => {
-                self.last_error = Some(e);
-                Ok(())
-            }
-            r => r,
-        };
+        let exec_result = self.finish_job(exec_result);
 
         self.record_end_of_job_warnings();
 
@@ -399,6 +419,8 @@ impl Interpreter {
     ///
     /// Useful for running test suites or scripts that don't produce pages.
     pub fn exec(&mut self, ps_data: &[u8]) -> Result<(), StetError> {
+        // `exec` keeps no pages and returns its error itself.
+        self.last_error = None;
         let save_obj = self.ctx.vm_save();
         let save_id = extract_save_id(&save_obj);
 
@@ -441,29 +463,62 @@ impl Interpreter {
         &self.warnings
     }
 
-    /// The error that ended the most recent render call early, when the
-    /// interpreter keeps partial pages ([`InterpreterBuilder::keep_partial_pages`]);
-    /// the pages it returned are those shown before the error, plus the one
-    /// being painted when it happened.
+    /// The error that ended the most recent call early, when the interpreter
+    /// keeps partial pages ([`InterpreterBuilder::keep_partial_pages`]); the
+    /// pages it returned are those shown before the error, plus the one being
+    /// painted when it happened.
+    ///
+    /// Cleared at the start of every [`render`](Interpreter::render),
+    /// [`render_to_display_list`](Interpreter::render_to_display_list),
+    /// `render_to_pdf` and [`exec`](Interpreter::exec) call. `exec` keeps no
+    /// pages and returns its error, so after it this is always `None`.
     pub fn last_error(&self) -> Option<&StetError> {
         self.last_error.as_ref()
     }
 
     /// End a page cut short by an error, so the marks painted so far are kept.
     fn flush_partial_page(&mut self) {
-        self.abandon_job();
+        let callers = self.abandon_job();
         let _ = parse_and_exec(&mut self.ctx, b"{ showpage } stopped pop");
+        self.ctx.deadline = callers;
     }
 
     /// After an error that left the job mid-flight: drop what it was running,
     /// so code run now does not resume it, and give that code a deadline of its
     /// own (a job that ran out of time would otherwise run out again at once,
     /// and `showpage` may be the program's own procedure).
-    fn abandon_job(&mut self) {
+    ///
+    /// Returns the caller's deadline, which the caller of this puts back once
+    /// that code has run: [`Context::set_timeout`] is absolute, so the flush's
+    /// own would otherwise outlive the call and stop a later one.
+    fn abandon_job(&mut self) -> Option<std::time::Instant> {
         self.ctx.o_stack.clear();
         self.ctx.e_stack.clear();
         self.ctx.loops.clear();
+        let callers = self.ctx.deadline;
         self.ctx.set_timeout(Some(FLUSH_DEADLINE));
+        callers
+    }
+
+    /// A job's result as the caller sees it. With partial pages kept, an
+    /// error ends the page being painted and is recorded in `last_error`
+    /// rather than failing the call; otherwise a clean run deactivates the
+    /// page device, which may transmit one more page.
+    fn finish_job(&mut self, exec_result: Result<(), StetError>) -> Result<(), StetError> {
+        let exec_result = match exec_result {
+            Err(e) if self.keep_partial => {
+                self.flush_partial_page();
+                Err(e)
+            }
+            r => r.and_then(|()| self.end_page_device()),
+        };
+        match exec_result.map_err(|e| self.named_error(e)) {
+            Err(e) if self.keep_partial => {
+                self.last_error = Some(e);
+                Ok(())
+            }
+            r => r,
+        }
     }
 
     /// The error a job ended in, by its PostScript name when the job ended in
@@ -484,6 +539,37 @@ impl Interpreter {
     /// Access the underlying Context for power-user operations.
     pub fn context(&mut self) -> &mut Context {
         &mut self.ctx
+    }
+
+    /// Let programs read `path` with `file` and `run`: everything inside
+    /// it if it is a folder, only itself if it is a file. Restricts them
+    /// to what is permitted, as [`InterpreterBuilder::safer`] does.
+    ///
+    /// An error when the folder `path` names, or would be in, does not
+    /// exist: a mistyped path would otherwise permit nothing.
+    pub fn permit_read(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.ctx.permit(Access::Read, path)
+    }
+
+    /// Let programs write `path` with `file` (`(w)` or `(a)`). The file
+    /// need not exist yet. Otherwise as [`Self::permit_read`].
+    pub fn permit_write(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.ctx.permit(Access::Write, path)
+    }
+
+    /// Let programs delete and rename `path` with `deletefile` and
+    /// `renamefile`. Otherwise as [`Self::permit_read`].
+    pub fn permit_control(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.ctx.permit(Access::Control, path)
+    }
+
+    /// [`Self::permit_read`], [`Self::permit_write`] and
+    /// [`Self::permit_control`] at once.
+    pub fn permit_all(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        self.permit_read(path)?;
+        self.permit_write(path)?;
+        self.permit_control(path)
     }
 
     /// Record a dropped-final-page warning if the job left marks unpainted.
@@ -508,49 +594,21 @@ impl Interpreter {
         self.ctx.capture_display_lists = Some(Vec::new());
         self.ctx.null_device_used = false;
 
-        #[cfg(feature = "render")]
-        let pages_ref = {
-            let (pages_ref, _) = shared_page_tracker();
-            self.setup_capture_device_factory(pages_ref.clone());
-            pages_ref
-        };
-        #[cfg(not(feature = "render"))]
-        {
-            self.setup_capture_device_factory(Arc::new(Mutex::new(Vec::<()>::new())));
-        }
+        let pages_ref = shared_page_tracker();
+        self.setup_capture_device_factory(pages_ref.clone());
 
         self.ctx.output_path = Some("stet_output".to_string());
         let save_id = self.begin_job(dpi, page_w_pt, page_h_pt)?;
 
-        self.last_error = None;
         let exec_result = parse_and_exec(&mut self.ctx, ps_data);
         let exec_result = job_result(&self.ctx, exec_result);
-        let exec_result = match exec_result {
-            Err(e) if self.keep_partial => {
-                self.flush_partial_page();
-                Err(e)
-            }
-            r => r.and_then(|()| self.end_page_device()),
-        };
-        let exec_result = exec_result.map_err(|e| self.named_error(e));
-        let exec_result = match exec_result {
-            Err(e) if self.keep_partial => {
-                self.last_error = Some(e);
-                Ok(())
-            }
-            r => r,
-        };
+        let exec_result = self.finish_job(exec_result);
 
         self.record_end_of_job_warnings();
         finish_device(&mut self.ctx);
 
-        #[cfg(feature = "render")]
-        let result = {
-            let pages = take_pages(&pages_ref);
-            collect_display_lists(&mut self.ctx, &pages, dpi)
-        };
-        #[cfg(not(feature = "render"))]
-        let result = collect_display_lists_simple(&mut self.ctx, dpi);
+        let pages = take_pages(&pages_ref);
+        let result = collect_display_lists(&mut self.ctx, &pages, dpi, (page_w_pt, page_h_pt));
 
         end_job(&mut self.ctx, save_id);
 
@@ -570,16 +628,8 @@ impl Interpreter {
         self.ctx.capture_display_lists = Some(Vec::new());
         self.ctx.null_device_used = false;
 
-        #[cfg(feature = "render")]
-        let pages_ref = {
-            let (pages_ref, _) = shared_page_tracker();
-            self.setup_capture_device_factory(pages_ref.clone());
-            pages_ref
-        };
-        #[cfg(not(feature = "render"))]
-        {
-            self.setup_capture_device_factory(Arc::new(Mutex::new(Vec::<()>::new())));
-        }
+        let pages_ref = shared_page_tracker();
+        self.setup_capture_device_factory(pages_ref.clone());
 
         self.ctx.output_path = Some("stet_output".to_string());
         let save_id = self.begin_job(dpi, w, h)?;
@@ -594,13 +644,8 @@ impl Interpreter {
         self.record_end_of_job_warnings();
         finish_device(&mut self.ctx);
 
-        #[cfg(feature = "render")]
-        let result = {
-            let pages = take_pages(&pages_ref);
-            collect_display_lists(&mut self.ctx, &pages, dpi)
-        };
-        #[cfg(not(feature = "render"))]
-        let result = collect_display_lists_simple(&mut self.ctx, dpi);
+        let pages = take_pages(&pages_ref);
+        let result = collect_display_lists(&mut self.ctx, &pages, dpi, (w, h));
 
         end_job(&mut self.ctx, save_id);
 
@@ -635,10 +680,10 @@ impl Interpreter {
         let wrapper = format!("gsave {} {} translate", -llx, -lly);
         parse_and_exec(&mut self.ctx, wrapper.as_bytes()).map_err(ps_err)?;
         let showpages_before = self.ctx.showpage_count;
-        self.last_error = None;
         let ran = parse_and_exec(&mut self.ctx, ps_data);
+        let mut callers_deadline = None;
         if let Err(e) = job_result(&self.ctx, ran) {
-            self.abandon_job();
+            callers_deadline = Some(self.abandon_job());
             if self.keep_partial {
                 self.last_error = Some(self.named_error(e));
             }
@@ -652,6 +697,9 @@ impl Interpreter {
         } else {
             let _ = parse_and_exec(&mut self.ctx, b"grestore");
         }
+        if let Some(d) = callers_deadline {
+            self.ctx.deadline = d;
+        }
         Ok(())
     }
 
@@ -664,7 +712,6 @@ impl Interpreter {
             .map_err(ps_err)
     }
 
-    #[cfg(feature = "render")]
     fn setup_capture_device_factory(&mut self, pages_ref: Arc<Mutex<Vec<PageDims>>>) {
         self.ctx.device_factory = Some(Box::new(move |w, h| {
             Box::new(PageSizeRecorder {
@@ -672,13 +719,6 @@ impl Interpreter {
                 height: h,
                 pages: pages_ref.clone(),
             }) as Box<dyn OutputDevice>
-        }));
-    }
-
-    #[cfg(not(feature = "render"))]
-    fn setup_capture_device_factory<T>(&mut self, _pages_ref: Arc<Mutex<Vec<T>>>) {
-        self.ctx.device_factory = Some(Box::new(|w, h| {
-            Box::new(stet_core::device::NullDevice::new(w, h))
         }));
     }
 }
@@ -699,6 +739,27 @@ impl InterpreterBuilder {
     /// Suppress PostScript stdout (`print`, `=`, `==` operators).
     pub fn suppress_output(mut self) -> Self {
         self.suppress_output = true;
+        self
+    }
+
+    /// Allow pages up to `points` a side (default 14400, 200 inches).
+    ///
+    /// A file that declares a larger `PageSize` or EPS bounding box is
+    /// clamped to it, and loses what lies beyond. Raise it when pages are not
+    /// rasterised at the file's size, or memory is bounded another way:
+    /// Illustrator artboards reach 16383 pt and its large canvas ten times
+    /// that. `f64::INFINITY` lifts the limit. See
+    /// [`Context::max_page_size_points`].
+    ///
+    /// # Panics
+    ///
+    /// If `points` is not greater than zero, NaN included.
+    pub fn max_page_size(mut self, points: f64) -> Self {
+        assert!(
+            points > 0.0,
+            "max_page_size must be greater than zero, got {points}"
+        );
+        self.max_page_size_points = points;
         self
     }
 
@@ -747,11 +808,48 @@ impl InterpreterBuilder {
         self
     }
 
+    /// How much of the host's file system programs reach with `file`,
+    /// `run`, `deletefile`, `renamefile`, `status` and `filenameforall`.
+    ///
+    /// [`FileAccess::Full`], the default, is the whole file system, as in
+    /// Ghostscript with `-dNOSAFER`. [`FileAccess::Safer`] is Ghostscript's
+    /// `-dSAFER`: stet's own resources and installed fonts, and what
+    /// [`Interpreter::permit_read`], [`permit_write`](Interpreter::permit_write)
+    /// and [`permit_control`](Interpreter::permit_control) allow. Fonts,
+    /// CMaps and color profiles stet finds itself are read as under `Full`,
+    /// so pages render the same. See [`stet_core::file_access`].
+    pub fn file_access(mut self, access: FileAccess) -> Self {
+        self.file_access = access;
+        self
+    }
+
+    /// [`file_access(FileAccess::Safer)`](Self::file_access): for documents
+    /// the program did not write.
+    pub fn safer(self) -> Self {
+        self.file_access(FileAccess::Safer)
+    }
+
     /// Keep the pages a program painted before an error: the render returns
     /// them, the page being painted included, and [`Interpreter::last_error`]
     /// says what went wrong. Off by default: an error fails the render.
     pub fn keep_partial_pages(mut self) -> Self {
         self.keep_partial = true;
+        self
+    }
+
+    /// The page a PostScript job starts on, in points (default Letter,
+    /// 612 x 792). The program's own `setpagedevice` still changes it; an EPS
+    /// with a bounding box gets its box instead.
+    ///
+    /// For a caller that knows the page better than the printer default,
+    /// such as one that read it from the file's DSC comments and checked
+    /// them against what the program draws. A width or height that is not
+    /// finite and greater than zero is ignored. Like a page the file
+    /// declares, it is clamped to [`max_page_size`](Self::max_page_size).
+    pub fn default_page_size(mut self, width: f64, height: f64) -> Self {
+        if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+            self.default_page = (width, height);
+        }
         self
     }
 
@@ -765,32 +863,6 @@ impl InterpreterBuilder {
     /// Off by default.
     pub fn keep_jpeg_data(mut self) -> Self {
         self.keep_jpeg = true;
-        self
-    }
-
-    /// Allow pages up to `points` a side (default 14400, 200 inches).
-    ///
-    /// A file that declares a larger `PageSize` or EPS bounding box is
-    /// clamped to it, and loses what lies beyond. Raise it when pages are not
-    /// rasterised at the file's size, or memory is bounded another way:
-    /// Illustrator artboards reach 16383 pt and its large canvas ten times
-    /// that. See [`Context::max_page_size_points`].
-    pub fn max_page_size(mut self, points: f64) -> Self {
-        self.max_page_size_points = points;
-        self
-    }
-
-    /// The page a PostScript job starts on, in points (default Letter,
-    /// 612 x 792). The program's own `setpagedevice` still changes it; an EPS
-    /// with a bounding box gets its box instead.
-    ///
-    /// For a caller that knows the page better than the printer default,
-    /// such as one that read it from the file's DSC comments and checked
-    /// them against what the program draws.
-    pub fn default_page_size(mut self, width: f64, height: f64) -> Self {
-        if width > 0.0 && height > 0.0 {
-            self.default_page = (width, height);
-        }
         self
     }
 
@@ -810,6 +882,8 @@ impl InterpreterBuilder {
     pub fn build(self) -> Interpreter {
         let mut ctx = init::create_initialized_context(self.use_icc, self.suppress_output)
             .expect("interpreter initialization failed");
+        // After initialization, whose scripts are stet's own.
+        ctx.file_access = self.file_access;
         ctx.text_extraction = self.text_extraction;
         ctx.set_default_rendering_intent(self.default_rendering_intent);
         ctx.max_page_size_points = self.max_page_size_points;
@@ -830,7 +904,6 @@ impl InterpreterBuilder {
 // --- Page dimension tracking ---
 
 /// Recorded page dimensions, one per page the job sends.
-#[cfg(feature = "render")]
 struct PageDims {
     width: u32,
     height: u32,
@@ -841,14 +914,12 @@ struct PageDims {
 /// lists itself (`Context::capture_display_lists`), so a device that also
 /// rasterised them — as a `SkiaDevice` into a discarding sink once did —
 /// rendered every page twice.
-#[cfg(feature = "render")]
 struct PageSizeRecorder {
     width: u32,
     height: u32,
     pages: Arc<Mutex<Vec<PageDims>>>,
 }
 
-#[cfg(feature = "render")]
 impl OutputDevice for PageSizeRecorder {
     fn fill_path(
         &mut self,
@@ -905,12 +976,10 @@ pub struct DisplayListPage {
 
 // --- Helpers ---
 
-#[cfg(feature = "render")]
-fn shared_page_tracker() -> (Arc<Mutex<Vec<PageDims>>>, ()) {
-    (Arc::new(Mutex::new(Vec::new())), ())
+fn shared_page_tracker() -> Arc<Mutex<Vec<PageDims>>> {
+    Arc::new(Mutex::new(Vec::new()))
 }
 
-#[cfg(feature = "render")]
 fn take_pages(pages_ref: &Arc<Mutex<Vec<PageDims>>>) -> Vec<PageDims> {
     match pages_ref.lock() {
         Ok(mut guard) => std::mem::take(&mut *guard),
@@ -957,11 +1026,13 @@ fn finish_device(ctx: &mut Context) {
     }
 }
 
-#[cfg(feature = "render")]
+/// Pair each captured display list with the size its page was sent at. A
+/// page the tracker did not record gets the job's page, `job_page` in points.
 fn collect_display_lists(
     ctx: &mut Context,
     pages: &[PageDims],
     default_dpi: f64,
+    job_page: (f64, f64),
 ) -> Vec<DisplayListPage> {
     let captured = ctx.capture_display_lists.take().unwrap_or_default();
     captured
@@ -979,28 +1050,10 @@ fn collect_display_lists(
             } else {
                 DisplayListPage {
                     display_list: dl,
-                    width: (612.0 * dpi / 72.0) as u32,
-                    height: (792.0 * dpi / 72.0) as u32,
+                    width: (job_page.0 * dpi / 72.0) as u32,
+                    height: (job_page.1 * dpi / 72.0) as u32,
                     dpi,
                 }
-            }
-        })
-        .collect()
-}
-
-/// Collect display lists without page dimension tracking (no-render fallback).
-#[cfg(not(feature = "render"))]
-fn collect_display_lists_simple(ctx: &mut Context, default_dpi: f64) -> Vec<DisplayListPage> {
-    let captured = ctx.capture_display_lists.take().unwrap_or_default();
-    captured
-        .into_iter()
-        .map(|(dl, dpi)| {
-            let dpi = if dpi > 0.0 { dpi } else { default_dpi };
-            DisplayListPage {
-                display_list: dl,
-                width: (612.0 * dpi / 72.0) as u32,
-                height: (792.0 * dpi / 72.0) as u32,
-                dpi,
             }
         })
         .collect()

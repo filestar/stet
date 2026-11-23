@@ -25,8 +25,11 @@ pub enum ColorSpace {
     DeviceRGB,
     DeviceCMYK,
     /// Indexed color space: `[/Indexed base hival lookup]`.
-    /// `lookup_proc` is `Some(proc_object)` when the lookup is a procedure that
-    /// needs to be pre-evaluated via exec_sync during setcolorspace.
+    /// `lookup_proc` is `Some(proc_object)` when the lookup is a procedure.
+    /// `setcolorspace` also samples it into `lookup`, each component clipped
+    /// to 0-1 and scaled to a byte, for a consumer that reads the palette
+    /// as bytes; the procedure stays, because its results are in the base
+    /// space's ranges, which a byte cannot hold for a CIE-based base.
     Indexed {
         base: Box<ColorSpace>,
         hival: u32,
@@ -189,7 +192,11 @@ impl PartialEq for ColorSpace {
 }
 
 /// Pattern instance data created by `makepattern`.
+///
+/// New fields may be added, so outside this crate start from
+/// [`Default`] and set the fields.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct PatternData {
     /// Pattern type: 1 = tiling, 2 = shading.
     pub pattern_type: i32,
@@ -212,6 +219,24 @@ pub struct PatternData {
     /// across the whole of what the pattern fills. `None` for a tiling
     /// pattern and for a shading without one.
     pub shading_background: Option<DeviceColor>,
+}
+
+impl Default for PatternData {
+    /// A coloured tiling pattern with an empty tile, no step and the
+    /// identity matrix.
+    fn default() -> Self {
+        Self {
+            pattern_type: 1,
+            paint_type: 1,
+            tiling_type: 1,
+            bbox: [0.0; 4],
+            xstep: 0.0,
+            ystep: 0.0,
+            pattern_matrix: Matrix::identity(),
+            cached_display_list: DisplayList::new(),
+            shading_background: None,
+        }
+    }
 }
 
 /// Entry on the graphics state stack, tracking whether it was created by

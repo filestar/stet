@@ -14,7 +14,7 @@ fn leaves(probe: &str, want: usize) -> [u8; 3] {
     );
     let mut interp = Interpreter::builder().suppress_output().build();
     let pages = interp.render(src.as_bytes(), 18.0).expect("renders");
-    assert_eq!(pages.len(), 1, "{:?}", interp.last_error());
+    assert_eq!(pages.len(), 1);
     let w = pages[0].width as usize;
     let at = ((pages[0].height as usize - 5) * w + 5) * 4;
     [
@@ -47,8 +47,21 @@ fn a_missing_instance_of_an_implicit_category_leaves_key_and_category() {
 
 #[test]
 fn a_found_procset_is_still_one_object() {
+    assert_eq!(leaves("/CIDInit /ProcSet findresource", 1), [0, 0, 255]);
+}
+
+#[test]
+fn a_key_naming_a_folder_leaves_key_and_category() {
+    // Refused before any file is looked for, the same way as a missing one.
+    assert_eq!(leaves("(a/b) /ProcSet findresource", 2), [0, 0, 255]);
+}
+
+#[test]
+fn an_unknown_output_device_leaves_the_stack_alone() {
+    // setpagedevice looks the device up with findresource and falls back to the request alone;
+    // the failed lookup's operands do not reach the program.
     assert_eq!(
-        leaves("/ColorRendering /ProcSet findresource", 1),
+        leaves("<< /OutputDevice /nosuchdev >> setpagedevice", 0),
         [0, 0, 255]
     );
 }

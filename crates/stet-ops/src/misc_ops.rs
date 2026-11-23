@@ -237,7 +237,7 @@ pub fn op_run(ctx: &mut Context) -> Result<(), PsError> {
     // Check embedded files first (for WASM builds where no real filesystem exists).
     // get_embedded_file normalizes paths (strips leading "/", collapses "//").
     if let Some(data) = ctx.files.get_embedded_file(&filename) {
-        let ps_data = stet_core::eps::strip_dos_eps_header(data);
+        let ps_data = stet_core::eps::strip_dos_eps_header(&data);
         let file_entity = ctx.files.create_string_source(ps_data.to_vec());
         let file_entity = ctx.adopt_file(file_entity);
         ctx.e_stack.push(PsObject {
@@ -249,7 +249,12 @@ pub fn op_run(ctx: &mut Context) -> Result<(), PsError> {
 
     let resolved = crate::file_ops::resolve_filename(ctx, &filename);
 
-    if !stet_fonts::host::host_access_allowed() {
+    // Before the disk is touched, so the refusal does not depend on
+    // whether the file exists.
+    if !ctx.host_policy().allows(
+        std::path::Path::new(&resolved),
+        stet_core::file_access::Access::Read,
+    ) {
         return Err(PsError::InvalidFileAccess);
     }
     let source = std::fs::read(&resolved).map_err(|_| PsError::UndefinedFilename)?;
@@ -453,11 +458,22 @@ pub fn op_loadbinarysystemfont(ctx: &mut Context) -> Result<(), PsError> {
     Ok(())
 }
 
+/// The folder fontcategory.ps looks for fonts in, its `ResourceDir`, with
+/// the separator it adds: the only folder [`op_loadbinaryfontfile`] reads
+/// from disk.
+const FONT_FOLDER: &str = "resources/Font/";
+
 /// `.loadbinaryfontfile`: name path → true | false
 ///
 /// Load a binary font from an explicit file path. Used by fontcategory.ps
 /// when .ttf/.otf files are found in resources/Font/. An embedded file of
 /// that path is taken before the disk is tried, as `run` and `file` do.
+/// On disk it reads only a file directly in that folder,
+/// `resources/Font/` and a [plain](stet_core::font_loader::is_plain_file_name)
+/// file name, which is what fontcategory.ps passes, found as `run` finds
+/// a file (so in the on-disk resource folder); any other path is
+/// `false`. It is a systemdict operator, so a program can call it too, and
+/// would otherwise load any file it names as a font.
 pub fn op_loadbinaryfontfile(ctx: &mut Context) -> Result<(), PsError> {
     if ctx.o_stack.len() < 2 {
         return Err(PsError::StackUnderflow);
@@ -474,10 +490,21 @@ pub fn op_loadbinaryfontfile(ctx: &mut Context) -> Result<(), PsError> {
     let path_str = String::from_utf8_lossy(&path_bytes);
     // Check embedded files first (for WASM builds where no real filesystem exists).
     let ok = if let Some(data) = ctx.files.get_embedded_file(path_str.as_ref()) {
-        stet_core::system_font_loader::load_binary_font_from_data(ctx, data)
+        stet_core::system_font_loader::load_binary_font_from_data(ctx, &data)
+    } else if !path_str
+        .strip_prefix(FONT_FOLDER)
+        .is_some_and(stet_core::font_loader::is_plain_file_name)
+    {
+        false
     } else {
-        let path = std::path::Path::new(path_str.as_ref());
-        stet_core::system_font_loader::load_binary_font(ctx, path)
+        // Found where `status` found it for fontcategory.ps, and `run`
+        // finds a `.t1` font: in the on-disk resource folder, not the
+        // working directory.
+        let resolved = crate::file_ops::resolve_filename(ctx, &path_str);
+        let path = std::path::Path::new(&resolved);
+        ctx.host_policy()
+            .allows(path, stet_core::file_access::Access::Read)
+            && stet_core::system_font_loader::load_binary_font(ctx, path)
     };
     ctx.o_stack.push(PsObject::bool(ok))?;
     Ok(())
@@ -873,6 +900,27 @@ pub fn op_internaldict(ctx: &mut Context) -> Result<(), PsError> {
 
     ctx.o_stack.pop()?;
     ctx.o_stack.push(PsObject::dict(entity))?;
+    Ok(())
+}
+
+/// `.break`: — → —, a place for a native debugger to stop.
+///
+/// It does nothing. Write `.break` in a PostScript program and set a
+/// breakpoint on this function, by its full path (in gdb,
+/// `break stet_ops::misc_ops::op_dot_break`): the debugger stops when the
+/// program reaches that point, with the interpreter's state there to
+/// inspect. It works in a release build too.
+///
+/// It was `break` until programs were found to rely on `break` being
+/// undefined, as it is in Ghostscript and on Adobe's printers:
+/// Illustrator's Adobe_pattern_AI3 prolog leaves a loop by calling it
+/// inside `stopped`, and with it defined the loop never ended. The dot
+/// keeps it among the interpreter's own names, which no program uses.
+#[inline(never)]
+pub fn op_dot_break(ctx: &mut Context) -> Result<(), PsError> {
+    // A body of its own, so the compiler does not merge it with another
+    // operator that does nothing and the breakpoint stops only here.
+    std::hint::black_box(ctx.e_stack.len());
     Ok(())
 }
 
@@ -1807,6 +1855,50 @@ mod tests {
         op_loadbinaryfontfile(&mut ctx).unwrap();
         let loaded = ctx.o_stack.pop().unwrap();
         assert!(matches!(loaded.value, PsValue::Bool(false)));
+    }
+
+    /// A font in the on-disk resource folder loads by the path
+    /// fontcategory.ps passes, `resources/Font/<name>.ttf`, found where
+    /// `status` and `run` find it rather than in the working directory.
+    #[test]
+    fn test_loadbinaryfontfile_reads_the_resource_folder_on_disk() {
+        let base = std::env::temp_dir().join(format!("stet-binres-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("Font")).unwrap();
+        std::fs::write(base.join("Font/Probe.ttf"), probe_sfnt()).unwrap();
+        let mut ctx = test_ctx();
+        ctx.resource_base_path = Some(base.to_string_lossy().into_owned());
+
+        push_loadbinaryfontfile_operands(&mut ctx, b"resources/Font/Probe.ttf");
+        op_loadbinaryfontfile(&mut ctx).unwrap();
+        let loaded = ctx.o_stack.pop().unwrap();
+        assert!(matches!(loaded.value, PsValue::Bool(true)));
+        let key = DictKey::Name(ctx.names.intern(b"Probe"));
+        assert!(ctx.dicts.get(ctx.font_directory, &key).is_some());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// On disk, only a file directly in the font folder is read: a font
+    /// anywhere else is `false`, named by its own path or through the font
+    /// folder, and nothing is loaded.
+    #[test]
+    fn test_loadbinaryfontfile_reads_no_font_outside_the_font_folder() {
+        let dir = std::env::temp_dir().join(format!("stet-binfont-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Probe.ttf");
+        std::fs::write(&file, probe_sfnt()).unwrap();
+        let absolute = file.to_string_lossy().into_owned();
+        let through = format!("resources/Font/../../../../../../../../../..{absolute}");
+
+        for path in [absolute.as_str(), through.as_str()] {
+            let mut ctx = test_ctx();
+            push_loadbinaryfontfile_operands(&mut ctx, path.as_bytes());
+            op_loadbinaryfontfile(&mut ctx).unwrap();
+            let loaded = ctx.o_stack.pop().unwrap();
+            assert!(matches!(loaded.value, PsValue::Bool(false)), "{path}");
+            let key = DictKey::Name(ctx.names.intern(b"Probe"));
+            assert!(ctx.dicts.get(ctx.font_directory, &key).is_none(), "{path}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

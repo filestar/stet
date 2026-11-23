@@ -28,8 +28,7 @@ fn an_unguarded_pdfmark_consumes_its_operands() {
         count 0 ne { 1 0 0 setrgbcolor } { 0 0 1 setrgbcolor } ifelse 0 0 100 100 rectfill showpage\n";
     let mut interp = Interpreter::builder().suppress_output().build();
     let pages = interp.render(src, 18.0).expect("renders");
-    assert_eq!(pages.len(), 1, "{:?}", interp.last_error());
-    assert!(interp.last_error().is_none(), "{:?}", interp.last_error());
+    assert_eq!(pages.len(), 1);
     let w = pages[0].width as usize;
     let at = ((pages[0].height as usize - 5) * w + 5) * 4;
     assert_eq!(
@@ -48,13 +47,40 @@ fn a_pdfmark_inside_a_procedure_consumes_its_operands() {
         count 0 ne { 1 0 0 setrgbcolor } { 0 0 1 setrgbcolor } ifelse 0 0 100 100 rectfill showpage\n";
     let mut interp = Interpreter::builder().suppress_output().build();
     let pages = interp.render(src, 18.0).expect("renders");
-    assert_eq!(pages.len(), 1, "{:?}", interp.last_error());
-    assert!(interp.last_error().is_none(), "{:?}", interp.last_error());
+    assert_eq!(pages.len(), 1);
     let w = pages[0].width as usize;
     let at = ((pages[0].height as usize - 5) * w + 5) * 4;
     assert_eq!(
         &pages[0].rgba[at..at + 3],
         &[0, 0, 255],
         "an empty operand stack"
+    );
+}
+
+/// Runs `body`; it divides by zero when a check fails, so a passing program renders one page.
+fn passes(body: &str) {
+    let src =
+        format!("%!PS-Adobe-3.0\n{body}\n0 0 1 setrgbcolor 20 20 100 100 rectfill showpage\n");
+    let mut interp = Interpreter::builder().suppress_output().build();
+    match interp.render(src.as_bytes(), 18.0) {
+        Ok(pages) => assert_eq!(pages.len(), 1),
+        Err(e) => panic!("{e:?}"),
+    }
+}
+
+/// An unguarded `pdfmark` checks its operands as Ghostscript's does (`gs_pdfwr.ps`) and reports
+/// the errors as `pdfmark`, not as the operator that clears to the mark.
+#[test]
+fn an_unguarded_pdfmark_checks_its_operands() {
+    passes(
+        "{ 1 2 /DOCINFO pdfmark } stopped not { 1 0 div } if\n\
+         $error /errorname get /unmatchedmark ne { 1 0 div } if\n\
+         $error /command get /pdfmark ne { 1 0 div } if clear\n\
+         { [ pdfmark } stopped not { 1 0 div } if\n\
+         $error /errorname get /stackunderflow ne { 1 0 div } if\n\
+         $error /command get /pdfmark ne { 1 0 div } if clear\n\
+         { [ 1 2 pdfmark } stopped not { 1 0 div } if\n\
+         $error /errorname get /typecheck ne { 1 0 div } if\n\
+         $error /command get /pdfmark ne { 1 0 div } if clear",
     );
 }

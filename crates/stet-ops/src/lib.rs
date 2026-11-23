@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 // stet - A PostScript Interpreter
 // Copyright (c) 2026 Scott Bowman
 // SPDX-License-Identifier: Apache-2.0 OR MIT
@@ -82,6 +81,7 @@ pub mod type_ops;
 pub mod userpath_ops;
 pub mod vm_ops;
 
+mod template;
 mod text_record;
 
 use stet_core::context::{Context, OpEntry};
@@ -268,6 +268,7 @@ pub fn build_system_dict(ctx: &mut Context) {
         "currentoverprintmode",
         misc_ops::op_currentoverprintmode,
     );
+    register(ctx, sd, ".break", misc_ops::op_dot_break);
     register(ctx, sd, "setcacheparams", misc_ops::op_setcacheparams);
     register(
         ctx,
@@ -779,6 +780,20 @@ pub fn build_system_dict(ctx: &mut Context) {
         "endtransparencygroup",
         transparency_ops::op_endtransparencygroup,
     );
+    // Ghostscript's forms (`pdfextensions.ps` aliases the rest of its
+    // dotted transparency operators).
+    register(
+        ctx,
+        sd,
+        ".begintransparencygroup",
+        transparency_ops::op_gs_begintransparencygroup,
+    );
+    register(
+        ctx,
+        sd,
+        ".endtransparencygroup",
+        transparency_ops::op_endtransparencygroup,
+    );
     register(ctx, sd, "beginsoftmask", transparency_ops::op_beginsoftmask);
     register(ctx, sd, "endsoftmask", transparency_ops::op_endsoftmask);
     register(ctx, sd, "clearsoftmask", transparency_ops::op_clearsoftmask);
@@ -802,6 +817,14 @@ pub fn build_system_dict(ctx: &mut Context) {
     register(ctx, sd, "a4", font_ops::op_a4);
     register(ctx, sd, "a3", font_ops::op_a3);
     register(ctx, sd, "b5", font_ops::op_b5);
+
+    // --- pdfmark: in the operator table only ---
+    // `systemdict` gets it from `register_pdf_authoring_ops` for a PDF job.
+    // Without it, an unguarded call reaches this operator through the
+    // evaluator's stand-in for an undefined `pdfmark`, which checks the
+    // operands and clears to the mark.
+    let pdfmark = ctx.names.intern(b"pdfmark");
+    push_operator(ctx, pdfmark, pdfmark_ops::op_pdfmark);
 
     // --- Default error handlers in errordict ---
     setup_errordict(ctx);

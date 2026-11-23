@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 // stet - A PostScript Interpreter
 // Copyright (c) 2026 Scott Bowman
 // SPDX-License-Identifier: Apache-2.0 OR MIT
@@ -44,6 +43,7 @@ pub use stet_graphics::mesh_shading;
 // ── Modules that remain in stet-core ────────────────────────────────────────
 pub mod array_store;
 pub mod binary_token;
+pub mod cmap;
 pub mod context;
 pub mod device;
 pub mod dict;
@@ -53,6 +53,7 @@ pub mod dual_string_store;
 pub mod entity_table;
 pub mod eps;
 pub mod error;
+pub mod file_access;
 pub mod file_store;
 pub mod font_loader;
 pub mod font_snapshot;

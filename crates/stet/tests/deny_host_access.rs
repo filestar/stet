@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Scott Bowman
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! `stet_fonts::host::deny_host_access` — a program rendering untrusted
+//! `stet::deny_host_access` — a program rendering untrusted
 //! documents keeps PostScript away from the computer.
 //!
 //! The switch is process-wide and one-way, so this file holds a single test
@@ -34,8 +34,9 @@ fn denied_host_access_refuses_files_and_runs() {
     assert!(!stops(&format!("({name}) (r) file closefile")));
     assert!(!stops(&format!("({name}) run")));
 
-    stet_fonts::host::deny_host_access();
-    assert!(!stet_fonts::host::host_access_allowed());
+    assert!(stet::host_access_allowed());
+    stet::deny_host_access();
+    assert!(!stet::host_access_allowed());
 
     assert!(stops(&format!("({name}) (r) file")), "file must refuse");
     assert!(stops(&format!("({name}) run")), "run must refuse");
@@ -75,6 +76,12 @@ fn denied_host_access_refuses_files_and_runs() {
     interp
         .exec(format!("({name}) status {{ 1 0 div }} if").as_bytes())
         .expect("status finds no host file");
+    // No permit lifts the denial.
+    let mut permitted = Interpreter::builder().suppress_output().build();
+    permitted.permit_all(&dir).unwrap();
+    permitted
+        .exec(format!("{{ ({name}) (r) file }} stopped not {{ 1 0 div }} if").as_bytes())
+        .expect("a permit does not lift deny_host_access");
     // %stdin reads as empty, %stdout swallows.
     interp
         .exec(b"(%stdin) (r) file read { 1 0 div } if (%stdout) (w) file (x) writestring")

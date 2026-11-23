@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io::{self, BufReader, IsTerminal, Read, Seek, Write};
 use std::sync::Arc;
 
+use crate::file_access::{Access, HostPolicy};
 use crate::object::{EntityId, PsObject};
 
 /// State for a RunLengthDecode filter.
@@ -263,6 +264,11 @@ pub struct FileEntry {
     /// as `EntityMeta::created_after_save` is for the other composites;
     /// 0 when no save was outstanding.
     pub created_after_save: u32,
+    /// Bytes put back on a disk file or `%stdin`, read again before the
+    /// file's own, last put back first (see [`FileStore::putback_bytes`]).
+    /// A file held in memory moves its position back instead, and a filter
+    /// keeps its own.
+    pushback: Vec<u8>,
 }
 
 /// Storage for all open PostScript files.
@@ -285,8 +291,32 @@ pub struct FileStore {
 }
 
 /// Supplies embedded files on demand: the normalized path in, the file's
-/// bytes out, or `None` when there is no such file.
-pub type EmbeddedProvider = Box<dyn Fn(&str) -> Option<&'static [u8]> + Send + Sync>;
+/// bytes out, or `None` when there is no such file. The bytes are shared, so
+/// a provider can hand over a file it builds or reads at run time and keep
+/// its own copy.
+pub type EmbeddedProvider = Box<dyn Fn(&str) -> Option<Arc<[u8]>> + Send + Sync>;
+
+/// An embedded file's bytes: built into the program, or supplied by the
+/// [`EmbeddedProvider`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum EmbeddedFile {
+    /// Registered with [`FileStore::add_embedded_file`].
+    Static(&'static [u8]),
+    /// Supplied by the provider set with [`FileStore::set_embedded_provider`].
+    Shared(Arc<[u8]>),
+}
+
+impl std::ops::Deref for EmbeddedFile {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Static(data) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
 
 /// Well-known file entity IDs. The standard files are in global VM, as in
 /// Ghostscript: no `restore` closes them.
@@ -312,6 +342,7 @@ impl FileStore {
             pending_newlines: 0,
             global: true,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         store.files.push(FileEntry {
             handle: FileHandle::Stdout,
@@ -321,6 +352,7 @@ impl FileStore {
             pending_newlines: 0,
             global: true,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         store.files.push(FileEntry {
             handle: FileHandle::Stderr,
@@ -330,6 +362,7 @@ impl FileStore {
             pending_newlines: 0,
             global: true,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         store
     }
@@ -343,18 +376,33 @@ impl FileStore {
     ///
     /// Normalizes the path by stripping leading `/` and collapsing `//` to `/`
     /// to handle paths like `/resources/Font//Helvetica.t1` built by PS code.
-    pub fn get_embedded_file(&self, path: &str) -> Option<&'static [u8]> {
-        if let Some(data) = self.embedded_files.get(path) {
-            return Some(*data);
+    pub fn get_embedded_file(&self, path: &str) -> Option<EmbeddedFile> {
+        if let Some(data) = self.embedded_file_named(path) {
+            return Some(data);
         }
         // Normalize: strip leading "/" and collapse "//" → "/"
         let normalized = path.trim_start_matches('/').replace("//", "/");
-        if normalized != path
-            && let Some(data) = self.embedded_files.get(normalized.as_str())
-        {
-            return Some(*data);
+        if normalized == path {
+            return None;
         }
-        self.embedded_provider.as_ref().and_then(|p| p(&normalized))
+        self.embedded_file_named(&normalized)
+    }
+
+    /// The embedded file `name` names exactly, built in or from the
+    /// provider. The provider is asked only for a name in its normalized
+    /// form: `open_with` decides by this lookup what is embedded, and a
+    /// spelling with a leading `/` or a `//` is a host path for its policy.
+    fn embedded_file_named(&self, name: &str) -> Option<EmbeddedFile> {
+        if let Some(data) = self.embedded_files.get(name) {
+            return Some(EmbeddedFile::Static(data));
+        }
+        if name.starts_with('/') || name.contains("//") {
+            return None;
+        }
+        self.embedded_provider
+            .as_ref()
+            .and_then(|p| p(name))
+            .map(EmbeddedFile::Shared)
     }
 
     /// Supply embedded files on demand: `provider` is asked for each path
@@ -370,7 +418,24 @@ impl FileStore {
     /// Open a file, returning its EntityId.
     ///
     /// For read mode, checks the embedded file map first (for WASM builds).
+    /// A host file is opened unless
+    /// [`deny_host_access`](stet_fonts::host::deny_host_access) was called;
+    /// [`Self::open_with`] applies a [`HostPolicy`] as well.
     pub fn open(&mut self, name: &str, mode: &str) -> io::Result<EntityId> {
+        self.open_with(name, mode, &HostPolicy::full())
+    }
+
+    /// [`Self::open`], opening a host file only where `policy` allows the
+    /// access `mode` needs: reading for `r`, writing for `w` and `a`, both
+    /// for `r+`. A refusal is [`io::ErrorKind::PermissionDenied`], whether
+    /// or not the file exists. Special files and embedded resources are not
+    /// host files.
+    pub fn open_with(
+        &mut self,
+        name: &str,
+        mode: &str,
+        policy: &HostPolicy<'_>,
+    ) -> io::Result<EntityId> {
         // Handle special names
         match name {
             "%stdin" => {
@@ -428,9 +493,11 @@ impl FileStore {
             _ => {}
         }
 
-        // Check embedded files for read access
+        // Check embedded files for read access. The name must match exactly,
+        // a built-in file or one from the provider alike: any other spelling
+        // is a host path, which the policy below decides on.
         if mode == "r"
-            && let Some(data) = self.get_embedded_file(name)
+            && let Some(data) = self.embedded_file_named(name)
         {
             let id = EntityId(self.files.len() as u32);
             self.files.push(FileEntry {
@@ -444,11 +511,20 @@ impl FileStore {
                 pending_newlines: 0,
                 global: false,
                 created_after_save: 0,
+                pushback: Vec::new(),
             });
             return Ok(id);
         }
 
-        if !stet_fonts::host::host_access_allowed() {
+        let path = std::path::Path::new(name);
+        let allowed = match mode {
+            "r" => policy.allows(path, Access::Read),
+            "w" | "a" => policy.allows(path, Access::Write),
+            "r+" => policy.allows(path, Access::Read) && policy.allows(path, Access::Write),
+            // Not a mode: refused as one below.
+            _ => true,
+        };
+        if !allowed {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "host access denied",
@@ -477,6 +553,7 @@ impl FileStore {
             pending_newlines: 0,
             global: false,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         Ok(id)
     }
@@ -501,6 +578,7 @@ impl FileStore {
             pending_newlines: 0,
             global: false,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         id
     }
@@ -530,6 +608,7 @@ impl FileStore {
             pending_newlines: 0,
             global: false,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         id
     }
@@ -554,6 +633,7 @@ impl FileStore {
             pending_newlines: 0,
             global: false,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         id
     }
@@ -572,6 +652,7 @@ impl FileStore {
             pending_newlines: 0,
             global: false,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         id
     }
@@ -592,6 +673,7 @@ impl FileStore {
             pending_newlines: 0,
             global: false,
             created_after_save: 0,
+            pushback: Vec::new(),
         });
         id
     }
@@ -785,6 +867,7 @@ impl FileStore {
             }
             _ => {
                 entry.handle = FileHandle::Closed;
+                entry.pushback.clear();
                 Ok(())
             }
         }
@@ -814,6 +897,11 @@ impl FileStore {
     /// Read one byte from a file. Returns None on EOF.
     pub fn read_byte(&mut self, entity: EntityId) -> io::Result<Option<u8>> {
         let entry = &mut self.files[entity.raw_index()];
+        if matches!(entry.handle, FileHandle::Real(_) | FileHandle::Stdin)
+            && let Some(b) = entry.pushback.pop()
+        {
+            return Ok(Some(b));
+        }
         match &mut entry.handle {
             FileHandle::Real(f) => {
                 let mut buf = [0u8; 1];
@@ -899,6 +987,20 @@ impl FileStore {
     /// Read into a buffer. Returns number of bytes actually read.
     pub fn read_into(&mut self, entity: EntityId, buf: &mut [u8]) -> io::Result<usize> {
         let entry = &mut self.files[entity.raw_index()];
+        if matches!(entry.handle, FileHandle::Real(_) | FileHandle::Stdin)
+            && !entry.pushback.is_empty()
+        {
+            // What was put back comes first, last put back first; the rest
+            // is read on the next call.
+            let mut n = 0;
+            while n < buf.len()
+                && let Some(b) = entry.pushback.pop()
+            {
+                buf[n] = b;
+                n += 1;
+            }
+            return Ok(n);
+        }
         match &mut entry.handle {
             FileHandle::Real(f) => f.read(buf),
             FileHandle::Stdin => {
@@ -1347,7 +1449,9 @@ impl FileStore {
     pub fn position(&mut self, entity: EntityId) -> io::Result<u64> {
         let entry = &mut self.files[entity.raw_index()];
         match &mut entry.handle {
-            FileHandle::Real(f) => f.stream_position(),
+            FileHandle::Real(f) => Ok(f
+                .stream_position()?
+                .saturating_sub(entry.pushback.len() as u64)),
             FileHandle::StringSource { pos, .. } => Ok(*pos as u64),
             FileHandle::Filter(state) => Ok(state.bytes_read),
             _ => Err(io::Error::other("not seekable")),
@@ -1360,6 +1464,7 @@ impl FileStore {
         match &mut entry.handle {
             FileHandle::Real(f) => {
                 f.seek(io::SeekFrom::Start(pos))?;
+                entry.pushback.clear();
                 Ok(())
             }
             FileHandle::StringSource { data, pos: p } => {
@@ -1379,6 +1484,7 @@ impl FileStore {
                 if entry.mode.starts_with('r') {
                     // Read file: consume remaining data and close (PLRM)
                     entry.handle = FileHandle::Closed;
+                    entry.pushback.clear();
                 } else if let FileHandle::Real(f) = &mut entry.handle {
                     f.get_mut().flush()?;
                 }
@@ -1456,11 +1562,17 @@ impl FileStore {
             FileHandle::StringSource { pos, .. } => {
                 *pos = pos.saturating_sub(bytes.len());
             }
-            FileHandle::Real(f) => {
-                // Seek backwards to put bytes back
-                let _ = f.seek(std::io::SeekFrom::Current(-(bytes.len() as i64)));
+            // Kept rather than sought back over: seeking fails on a pipe or a
+            // FIFO, and `%stdin` cannot seek at all, so the bytes were lost
+            // there. Reading takes them before the file's own.
+            FileHandle::Real(_) | FileHandle::Stdin => {
+                entry.pushback.extend(bytes.iter().rev());
             }
-            _ => {}
+            // Nothing is read from these, so nothing comes back to them.
+            FileHandle::Stdout
+            | FileHandle::Stderr
+            | FileHandle::Closed
+            | FileHandle::PendingProc { .. } => {}
         }
     }
 
@@ -1488,7 +1600,7 @@ impl FileStore {
                 if let Ok(cur) = f.stream_position() {
                     if let Ok(end) = f.seek(io::SeekFrom::End(0)) {
                         let _ = f.seek(io::SeekFrom::Start(cur));
-                        let remaining = end.saturating_sub(cur);
+                        let remaining = end.saturating_sub(cur) + entry.pushback.len() as u64;
                         if remaining == 0 {
                             -1 // at EOF
                         } else {
@@ -1634,13 +1746,65 @@ impl FileStore {
         }
     }
 
+    /// One JPEG from `source`, through its end-of-image marker (`FF D9`),
+    /// leaving whatever follows unread: a `DCTDecode` filter's data ends
+    /// there, as Ghostscript's does. Marker segments are skipped by their
+    /// length, so an `FF D9` inside one (in an embedded thumbnail, say) does
+    /// not end it, and in the entropy-coded data a stuffed `FF 00` and the
+    /// restart markers are data. Without an end-of-image marker, everything
+    /// up to the end of the source.
+    ///
+    /// Reading the whole source instead made a JPEG read straight from
+    /// `currentfile` swallow the rest of the program, and its page with it.
+    pub fn read_jpeg(&mut self, source: EntityId) -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        while let Some(b) = self.read_byte(source)? {
+            data.push(b);
+            if b != 0xFF {
+                continue;
+            }
+            // A marker, after any fill bytes.
+            let mut marker = 0xFF;
+            while marker == 0xFF {
+                let Some(c) = self.read_byte(source)? else {
+                    return Ok(data);
+                };
+                data.push(c);
+                marker = c;
+            }
+            match marker {
+                0xD9 => return Ok(data),
+                // A stuffed FF in entropy-coded data, a restart marker, the
+                // start of the image, or TEM: nothing follows them.
+                0x00 | 0xD0..=0xD8 | 0x01 => {}
+                // A segment, its length counting its own two bytes.
+                _ => {
+                    let mut len = 0usize;
+                    for _ in 0..2 {
+                        let Some(c) = self.read_byte(source)? else {
+                            return Ok(data);
+                        };
+                        data.push(c);
+                        len = (len << 8) | c as usize;
+                    }
+                    for _ in 0..len.saturating_sub(2) {
+                        let Some(c) = self.read_byte(source)? else {
+                            return Ok(data);
+                        };
+                        data.push(c);
+                    }
+                }
+            }
+        }
+        Ok(data)
+    }
+
     /// The JPEG data under a `DCTDecode` filter nothing has read from yet,
     /// read whole from the filter's source, with the filter's
     /// `ColorTransform`. For a consumer that keeps a JPEG image as it is
     /// instead of its samples: the filter is left at its end, as reading every
     /// sample would leave it. `None`, with nothing read, when `entity` is not
     /// such a filter.
-    #[allow(clippy::type_complexity)]
     pub fn take_dct_data(
         &mut self,
         entity: EntityId,
@@ -1662,7 +1826,7 @@ impl FileStore {
             }
             _ => return None,
         };
-        let data = match self.read_all(source) {
+        let data = match self.read_jpeg(source) {
             Ok(d) => d,
             Err(e) => return Some(Err(e)),
         };
@@ -1679,7 +1843,7 @@ impl FileStore {
         Some(Ok((data, color_transform)))
     }
 
-    /// Read all remaining bytes from a source (used by DCTDecode at creation).
+    /// Read all remaining bytes from a source.
     pub fn read_all(&mut self, entity: EntityId) -> io::Result<Vec<u8>> {
         let mut data = Vec::new();
         while let Some(b) = self.read_byte(entity)? {
@@ -1738,9 +1902,9 @@ impl FileStore {
             }
             FilterKind::DCTDecode { decoded, .. } => {
                 if !*decoded {
-                    // Lazy decode: read all JPEG data from source, then decode
+                    // Lazy decode: read the JPEG from the source, then decode
                     let source = state.source;
-                    let mut jpeg_data = self.read_all(source)?;
+                    let mut jpeg_data = self.read_jpeg(source)?;
                     // A JPEG stream inside PostScript or PDF routinely arrives
                     // without its end-of-image marker — the writer stops at the
                     // stream's length and leaves the two bytes off. Supplying
@@ -1806,17 +1970,28 @@ impl FileStore {
                     state.eof = true;
                 }
             }
-            FilterKind::CCITTFaxDecode { decoded, .. } => {
+            FilterKind::CCITTFaxDecode {
+                decoded,
+                k,
+                columns,
+                rows,
+                encoded_byte_align,
+                end_of_block,
+                black_is1,
+                ..
+            } => {
                 if !*decoded {
-                    let source = state.source;
-                    let ccitt_data = self.read_all(source)?;
-                    let decoded_bytes = Self::decode_ccittfax(&ccitt_data, &mut state.kind)?;
-                    state.output_buf = decoded_bytes;
+                    let params = stet_graphics::ccitt::CcittParams {
+                        k: *k,
+                        columns: *columns,
+                        rows: *rows,
+                        end_of_block: *end_of_block,
+                        encoded_byte_align: *encoded_byte_align,
+                        black_is1: *black_is1,
+                    };
+                    *decoded = true;
+                    state.output_buf = self.read_ccitt(state.source, &params)?;
                     state.output_pos = 0;
-                    // Mark as decoded (re-borrow after decode_ccittfax)
-                    if let FilterKind::CCITTFaxDecode { decoded, .. } = &mut state.kind {
-                        *decoded = true;
-                    }
                 } else {
                     state.eof = true;
                 }
@@ -1888,6 +2063,23 @@ impl FileStore {
                             Some(high) => out.push((high << 4) | n),
                         }
                     }
+                }
+            }
+        }
+        // A full buffer ends on a whole byte, so no nibble is pending. Take a
+        // `>` that follows it, for the reason `refill_ascii85` takes its `~>`:
+        // a reader that wants exactly these bytes never asks again, and the
+        // `>` left in the source is a syntax error to the interpreter.
+        loop {
+            match self.read_byte(source)? {
+                Some(b) if b.is_ascii_whitespace() => {}
+                Some(b'>') | None => {
+                    *eof = true;
+                    break;
+                }
+                Some(b) => {
+                    self.putback_bytes(source, &[b]);
+                    break;
                 }
             }
         }
@@ -2062,6 +2254,26 @@ impl FileStore {
                 RleState::Eod => {
                     *eof = true;
                     return Ok(());
+                }
+            }
+        }
+        // A full buffer that ends a run: take the end-of-data byte (128) if
+        // it comes next, for the reason `refill_ascii85` takes its `~>`. Left
+        // in the source, it reaches the interpreter as program text.
+        if matches!(
+            rle_state,
+            RleState::Init
+                | RleState::Literal { remaining: 0 }
+                | RleState::Repeat { remaining: 0, .. }
+        ) {
+            match self.read_byte(source)? {
+                Some(128) | None => {
+                    *rle_state = RleState::Eod;
+                    *eof = true;
+                }
+                Some(b) => {
+                    self.putback_bytes(source, &[b]);
+                    *rle_state = RleState::Init;
                 }
             }
         }
@@ -2350,84 +2562,50 @@ impl FileStore {
         Ok(())
     }
 
-    /// Decode CCITT Group 3 or Group 4 fax data using the `fax` crate.
-    fn decode_ccittfax(data: &[u8], kind: &mut FilterKind) -> io::Result<Vec<u8>> {
-        let FilterKind::CCITTFaxDecode {
-            k,
-            columns,
-            rows,
-            end_of_block,
-            black_is1,
-            ..
-        } = kind
-        else {
-            return Err(io::Error::other("not a CCITTFaxDecode filter"));
-        };
-        let k = *k;
-        let width = *columns as u16;
-        let rows_limit = *rows;
-        let end_of_block = *end_of_block;
-        let black_is1 = *black_is1;
-
-        // Bytes per scan line (1 bit per pixel, padded to byte boundary)
-        let row_bytes = (width as usize).div_ceil(8);
-        let mut output = Vec::new();
-        let mut line_count: u32 = 0;
-
-        // Callback to process each decoded line
-        let mut process_line = |transitions: &[u16]| {
-            // Stop after Rows lines if EndOfBlock is false and Rows > 0
-            if !end_of_block && rows_limit > 0 && line_count >= rows_limit {
-                return;
-            }
-
-            // Convert transitions to pixels and pack into bytes
-            let line = fax::decoder::Line { transitions, width };
-            let mut row = vec![0u8; row_bytes];
-            for (i, color) in line.pels().enumerate() {
-                if i >= width as usize {
-                    break;
-                }
-                // fax crate: Color::Black = mark bit, Color::White = no bit
-                // Pack MSB-first: pixel 0 in bit 7
-                let is_set = matches!(color, fax::Color::Black);
-                if is_set {
-                    row[i / 8] |= 0x80 >> (i % 8);
+    /// Decode a fax image from `source`, reading only as far as it goes:
+    /// the data ends at its end-of-block code, or after its last row, and
+    /// what follows is left in the source, as Ghostscript leaves it.
+    ///
+    /// The source is read in chunks, each twice the last, until the decoder
+    /// finishes inside what has been read, and the bytes past its end are
+    /// put back. Reading the whole source instead made an image read
+    /// straight from `currentfile` swallow the rest of the program. When the
+    /// data is malformed, where it ends is unknown, and the whole source is
+    /// the image's, as before.
+    fn read_ccitt(
+        &mut self,
+        source: EntityId,
+        params: &stet_graphics::ccitt::CcittParams,
+    ) -> io::Result<Vec<u8>> {
+        use stet_graphics::ccitt::CcittEnd;
+        let mut data = Vec::new();
+        let mut want = 16 * 1024;
+        let mut exhausted = false;
+        loop {
+            while !exhausted && data.len() < want {
+                match self.read_byte(source)? {
+                    Some(b) => data.push(b),
+                    None => exhausted = true,
                 }
             }
-
-            // Apply BlackIs1 polarity:
-            // CCITT convention: 1 = black (mark). fax crate follows this.
-            // PostScript convention (BlackIs1=false, default): 0 = black, 1 = white
-            // So when BlackIs1 is false, we invert all bits.
-            if !black_is1 {
-                for byte in &mut row {
-                    *byte = !*byte;
+            let image = stet_graphics::ccitt::decode(&data, params);
+            match image.end {
+                // Ended inside what was read: the rest goes back.
+                CcittEnd::Finished(n) if n < data.len() => {
+                    self.putback_bytes(source, &data[n..]);
+                    return Ok(image.data);
                 }
+                // Ended at the end of the source, or had too little.
+                _ if exhausted => return Ok(image.data),
+                CcittEnd::Malformed => {
+                    data.extend(self.read_all(source)?);
+                    return Ok(stet_graphics::ccitt::decode(&data, params).data);
+                }
+                // Ran out, or ended exactly where the reading stopped,
+                // which may be a row boundary with more rows to come.
+                _ => want *= 2,
             }
-
-            output.extend_from_slice(&row);
-            line_count += 1;
-        };
-
-        if k < 0 {
-            // Group 4
-            let height = if rows_limit > 0 {
-                Some(rows_limit as u16)
-            } else {
-                None
-            };
-            fax::decoder::decode_g4(data.iter().copied(), width, height, |transitions| {
-                process_line(transitions)
-            });
-        } else {
-            // Group 3 (K=0: 1-D only, K>0: mixed 1-D/2-D)
-            fax::decoder::decode_g3(data.iter().copied(), |transitions| {
-                process_line(transitions);
-            });
         }
-
-        Ok(output)
     }
 
     /// Refill EexecDecode: read from source, decrypt with eexec cipher.
@@ -3285,6 +3463,80 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
+    /// A noisy Group 4 image `w` x `h` (`w` a multiple of 8), encoded with
+    /// the `fax` crate, and its rows as `CCITTFaxDecode` gives them: a
+    /// black pixel is a 0 bit.
+    fn g4_noise(w: u16, h: u16) -> (Vec<u8>, Vec<u8>) {
+        let mut seed = 12345u32;
+        let mut rows = Vec::new();
+        let mut encoder = fax::encoder::Encoder::new(fax::VecWriter::new());
+        for _ in 0..h {
+            let black: Vec<bool> = (0..w)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                    (seed >> 16) & 3 == 0
+                })
+                .collect();
+            let pels = black.iter().map(|&b| {
+                if b {
+                    fax::Color::Black
+                } else {
+                    fax::Color::White
+                }
+            });
+            encoder.encode_line(pels, w).unwrap();
+            let mut row = vec![0u8; w as usize / 8];
+            for (i, _) in black.iter().enumerate().filter(|(_, b)| !**b) {
+                row[i / 8] |= 0x80 >> (i % 8);
+            }
+            rows.extend(row);
+        }
+        (encoder.finish().unwrap().finish(), rows)
+    }
+
+    /// A fax image read through `CCITTFaxDecode` from `data` followed by
+    /// `tail`: what the filter gives, and what is left in the source.
+    fn ccitt_from(data: &[u8], tail: &[u8], kind: FilterKind) -> (Vec<u8>, Vec<u8>) {
+        let mut store = FileStore::new();
+        let src = store.create_string_source([data, tail].concat());
+        let filt = store.create_filter(src, kind);
+        let mut out = Vec::new();
+        while let Some(b) = store.read_byte(filt).unwrap() {
+            out.push(b);
+        }
+        let mut rest = Vec::new();
+        while let Some(b) = store.read_byte(src).unwrap() {
+            rest.push(b);
+        }
+        (out, rest)
+    }
+
+    /// An image larger than the first chunks read is decoded whole, and
+    /// the source is left just after its end-of-block code.
+    #[test]
+    fn test_ccitt_reads_only_the_image() {
+        let (data, rows) = g4_noise(1200, 400);
+        assert!(
+            data.len() > 64 * 1024,
+            "spans several chunks: {}",
+            data.len()
+        );
+        let kind = FilterKind::ccittfax_decode(-1, 1200, 400, false, false, true, false);
+        let (out, rest) = ccitt_from(&data, b"\nrest of the program", kind);
+        assert!(out == rows, "the image decodes whole");
+        assert_eq!(rest, b"\nrest of the program");
+    }
+
+    /// Without `Rows`, the end-of-block code alone ends it.
+    #[test]
+    fn test_ccitt_without_rows_ends_at_its_end_of_block() {
+        let (data, rows) = g4_noise(64, 40);
+        let kind = FilterKind::ccittfax_decode(-1, 64, 0, false, false, true, false);
+        let (out, rest) = ccitt_from(&data, b"rest", kind);
+        assert!(out == rows);
+        assert_eq!(rest, b"rest");
+    }
+
     #[test]
     fn test_ascii85_full_buffer_takes_the_eod_after_it() {
         // 4096 bytes are one full refill: a reader that takes exactly those
@@ -3323,6 +3575,115 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 4100);
+    }
+
+    /// `src` through `kind`: what the filter gives, and what is left in
+    /// the source after the filter's first 4096 bytes are read.
+    fn after_a_full_buffer(src: Vec<u8>, kind: FilterKind) -> (usize, Vec<u8>) {
+        let mut store = FileStore::new();
+        let src = store.create_string_source(src);
+        let filt = store.create_filter(src, kind);
+        for _ in 0..4096 {
+            assert!(store.read_byte(filt).unwrap().is_some());
+        }
+        let mut rest = Vec::new();
+        while let Some(b) = store.read_byte(src).unwrap() {
+            rest.push(b);
+        }
+        let mut more = 0;
+        while store.read_byte(filt).unwrap().is_some() {
+            more += 1;
+        }
+        (4096 + more, rest)
+    }
+
+    /// Everything `src` gives through `kind`.
+    fn all_of(src: Vec<u8>, kind: FilterKind) -> Vec<u8> {
+        let mut store = FileStore::new();
+        let src = store.create_string_source(src);
+        let filt = store.create_filter(src, kind);
+        let mut out = Vec::new();
+        while let Some(b) = store.read_byte(filt).unwrap() {
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn test_asciihex_full_buffer_takes_the_eod_after_it() {
+        let mut src = b"4142".repeat(2048);
+        src.extend_from_slice(b"\r\n>\r\nrest");
+        let (n, rest) = after_a_full_buffer(src, FilterKind::ASCIIHexDecode);
+        assert_eq!((n, rest.as_slice()), (4096, &b"\r\nrest"[..]));
+    }
+
+    #[test]
+    fn test_asciihex_full_buffer_leaves_what_is_not_eod() {
+        let mut src = b"4142".repeat(2048);
+        src.extend_from_slice(b"\n4344>");
+        let out = all_of(src, FilterKind::ASCIIHexDecode);
+        assert_eq!(out.len(), 4098);
+        assert_eq!(&out[4096..], b"CD");
+    }
+
+    /// 4096 bytes as 32 literal runs of 128.
+    fn rle_runs() -> Vec<u8> {
+        let mut src = Vec::new();
+        for run in 0..32u8 {
+            src.push(127);
+            src.extend(std::iter::repeat_n(run, 128));
+        }
+        src
+    }
+
+    #[test]
+    fn test_rle_full_buffer_takes_the_eod_after_it() {
+        let mut src = rle_runs();
+        src.extend_from_slice(b"\x80rest");
+        let (n, rest) = after_a_full_buffer(
+            src,
+            FilterKind::RunLengthDecode {
+                state: RleState::Init,
+            },
+        );
+        assert_eq!((n, rest.as_slice()), (4096, &b"rest"[..]));
+    }
+
+    #[test]
+    fn test_rle_full_buffer_leaves_what_is_not_eod() {
+        // A literal run and a repeated one after the full buffer.
+        let mut src = rle_runs();
+        src.extend_from_slice(&[1, b'x', b'y', 254, b'z', 128]);
+        let out = all_of(
+            src,
+            FilterKind::RunLengthDecode {
+                state: RleState::Init,
+            },
+        );
+        assert_eq!(out.len(), 4096 + 5);
+        assert_eq!(&out[4096..], b"xyzzz");
+    }
+
+    #[test]
+    fn test_rle_run_across_a_full_buffer_is_whole() {
+        // 4000 literal bytes, then a 200-byte repeat that the full buffer
+        // splits: nothing is looked past while a run is still going.
+        let mut src = Vec::new();
+        for _ in 0..31 {
+            src.push(127);
+            src.extend(std::iter::repeat_n(b'a', 128));
+        }
+        src.push(31);
+        src.extend(std::iter::repeat_n(b'a', 32));
+        src.extend_from_slice(&[129, b'b', 129, b'b', 128]);
+        let out = all_of(
+            src,
+            FilterKind::RunLengthDecode {
+                state: RleState::Init,
+            },
+        );
+        assert_eq!(out.len(), 4000 + 256);
+        assert!(out[4000..].iter().all(|&b| b == b'b'));
     }
 
     // --- RunLengthDecode tests ---

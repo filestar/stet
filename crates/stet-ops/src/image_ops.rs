@@ -102,7 +102,7 @@ pub fn op_image(ctx: &mut Context) -> Result<(), PsError> {
         ctx.o_stack.pop()?; // width
 
         let data = collect_proc_data(ctx, procedure, total_bytes)?;
-        let samples = unpack_samples(data, width as u32, height as u32, bps as u32, ncomp, false);
+        let samples = unpack_samples(data, width as u32, height as u32, bps as u32, ncomp);
         draw_image_to_device(
             ctx,
             samples,
@@ -126,7 +126,7 @@ pub fn op_image(ctx: &mut Context) -> Result<(), PsError> {
     let data = read_image_data(ctx, src_obj, total_bytes)?;
 
     // Unpack to 8-bit
-    let samples = unpack_samples(data, width as u32, height as u32, bps as u32, ncomp, false);
+    let samples = unpack_samples(data, width as u32, height as u32, bps as u32, ncomp);
 
     // Draw with DeviceGray (5-operand form is always grayscale)
     draw_image_to_device(
@@ -199,9 +199,14 @@ fn image_dict_form(ctx: &mut Context) -> Result<(), PsError> {
         }
     };
 
-    // Fill default decode if empty
+    // Fill default decode if empty: an index's is 0 to 2^bps - 1, so that
+    // each sample is its index (PLRM 3e §4.10.5).
+    let indexed_hival = match ctx.gstate.color_space {
+        ColorSpace::Indexed { hival, .. } => Some(hival),
+        _ => None,
+    };
     let decode = if decode.is_empty() {
-        (0..ncomp).flat_map(|_| [0.0, 1.0]).collect()
+        default_decode(ncomp, bps, indexed_hival.is_some())
     } else {
         decode
     };
@@ -280,7 +285,8 @@ fn image_dict_form(ctx: &mut Context) -> Result<(), PsError> {
         read_image_data(ctx, data_source, total_bytes)?
     };
 
-    let indexed = matches!(ctx.gstate.color_space, ColorSpace::Indexed { .. });
+    let indexed = indexed_hival.is_some();
+    // An index goes through its Decode in `indexed_image_indices`.
     let needs_decode = !indexed && !is_identity_decode(&decode, ncomp);
 
     // ImageType 4: MaskColor names samples as encoded, before reduction to
@@ -299,18 +305,30 @@ fn image_dict_form(ctx: &mut Context) -> Result<(), PsError> {
         None
     };
     let key_alpha = key.as_ref().and_then(|k| k.alpha(&data, width, height));
+    // The renderer tests the samples it is given, so an index's key holds
+    // only while each sample is its index.
+    let samples_are_indices = !indexed || decode == default_decode(1, bps, true);
     let render_key = match &key {
-        Some(k) if key_alpha.is_some() && bps <= 8 && !needs_decode => {
+        Some(k) if key_alpha.is_some() && bps <= 8 && !needs_decode && samples_are_indices => {
             Some(k.ranges_8bit(|v| if indexed { v as u8 } else { to_8bit(v, bps) }))
         }
         _ => None,
     };
 
-    // Unpack samples to 8-bit
-    let samples = unpack_samples(data, width, height, bps, ncomp, indexed);
+    // An index per sample in an Indexed space, else samples unpacked to
+    // 8 bits.
+    let indices =
+        indexed_hival.map(|hival| indexed_image_indices(&data, width, height, bps, &decode, hival));
+    let samples = match &indices {
+        Some(_) => Vec::new(),
+        None => unpack_samples(data, width, height, bps, ncomp),
+    };
 
     if let Some(alpha) = key_alpha.as_ref().filter(|_| render_key.is_none()) {
-        let mut rgba = samples_to_rgba(ctx, &samples, width, height, ncomp, &decode);
+        let mut rgba = match &indices {
+            Some(indices) => indexed_rgba(ctx, indices),
+            None => samples_to_rgba(ctx, &samples, width, height, ncomp, &decode),
+        };
         clear_masked_pixels(&mut rgba, alpha);
         draw_image_to_device(
             ctx,
@@ -322,11 +340,27 @@ fn image_dict_form(ctx: &mut Context) -> Result<(), PsError> {
             None,
         );
     } else if let Some(img_cs) = capture_image_color_space(ctx) {
-        // Apply decode to samples if non-identity (for non-indexed spaces)
-        let final_samples = if needs_decode {
-            apply_decode(&samples, ncomp, &decode)
-        } else {
-            samples
+        let (final_samples, img_cs) = match (indices, img_cs) {
+            // A palette of more than 256 entries has indices the 8-bit
+            // pipeline cannot carry: the image is drawn in the base space.
+            (Some(indices), ImageColorSpace::Indexed { base, lookup, .. })
+                if indexed_hival.is_some_and(|h| h > 255) =>
+            {
+                let m = base.num_components() as usize;
+                let samples = indices
+                    .iter()
+                    .flat_map(|&i| {
+                        let at = i as usize * m;
+                        (0..m).map(move |c| at + c)
+                    })
+                    .map(|j| lookup.get(j).copied().unwrap_or(0))
+                    .collect();
+                (samples, *base)
+            }
+            (Some(indices), img_cs) => (indices.iter().map(|&i| i as u8).collect(), img_cs),
+            // Apply decode to samples if non-identity
+            (None, img_cs) if needs_decode => (apply_decode(&samples, ncomp, &decode), img_cs),
+            (None, img_cs) => (samples, img_cs),
         };
         draw_image_to_device(
             ctx,
@@ -339,7 +373,10 @@ fn image_dict_form(ctx: &mut Context) -> Result<(), PsError> {
         );
     } else {
         // CIE DEF/DEFG, Separation, DeviceN: convert to RGB at op time
-        let mut rgba = samples_to_rgba(ctx, &samples, width, height, ncomp, &decode);
+        let mut rgba = match &indices {
+            Some(indices) => indexed_rgba(ctx, indices),
+            None => samples_to_rgba(ctx, &samples, width, height, ncomp, &decode),
+        };
         if let Some(alpha) = &key_alpha {
             clear_masked_pixels(&mut rgba, alpha);
             draw_image_to_device(
@@ -436,8 +473,12 @@ fn image_type3_form(
         }
     };
 
+    let indexed_hival = match ctx.gstate.color_space {
+        ColorSpace::Indexed { hival, .. } => Some(hival),
+        _ => None,
+    };
     let img_decode = if img_decode.is_empty() {
-        (0..ncomp).flat_map(|_| [0.0, 1.0]).collect()
+        default_decode(ncomp, img_bps, indexed_hival.is_some())
     } else {
         img_decode
     };
@@ -484,9 +525,17 @@ fn image_type3_form(
 
     // Type 3 masked images: convert to RGBA at op time (stencil mask
     // needs alpha compositing, and these images are relatively rare)
-    let indexed = matches!(ctx.gstate.color_space, ColorSpace::Indexed { .. });
-    let samples = unpack_samples(img_data, img_w, img_h, img_bps, ncomp, indexed);
-    let mut rgba = samples_to_rgba(ctx, &samples, img_w, img_h, ncomp, &img_decode);
+    let mut rgba = match indexed_hival {
+        Some(hival) => {
+            let indices =
+                indexed_image_indices(&img_data, img_w, img_h, img_bps, &img_decode, hival);
+            indexed_rgba(ctx, &indices)
+        }
+        None => {
+            let samples = unpack_samples(img_data, img_w, img_h, img_bps, ncomp);
+            samples_to_rgba(ctx, &samples, img_w, img_h, ncomp, &img_decode)
+        }
+    };
 
     // Apply stencil mask to alpha channel
     apply_stencil_mask(
@@ -1175,14 +1224,8 @@ pub fn op_colorimage(ctx: &mut Context) -> Result<(), PsError> {
                 ncomp as u32,
             );
 
-            let samples = unpack_samples(
-                data,
-                width as u32,
-                height as u32,
-                bps as u32,
-                ncomp as u32,
-                false,
-            );
+            let samples =
+                unpack_samples(data, width as u32, height as u32, bps as u32, ncomp as u32);
             let cs = colorimage_color_space(ncomp);
             draw_image_to_device(
                 ctx,
@@ -1224,14 +1267,8 @@ pub fn op_colorimage(ctx: &mut Context) -> Result<(), PsError> {
                 ctx.o_stack.pop()?;
             }
             let data = collect_proc_data(ctx, procedure, total_bytes)?;
-            let samples = unpack_samples(
-                data,
-                width as u32,
-                height as u32,
-                bps as u32,
-                ncomp as u32,
-                false,
-            );
+            let samples =
+                unpack_samples(data, width as u32, height as u32, bps as u32, ncomp as u32);
             let cs = colorimage_color_space(ncomp);
             draw_image_to_device(
                 ctx,
@@ -1252,14 +1289,7 @@ pub fn op_colorimage(ctx: &mut Context) -> Result<(), PsError> {
         ctx.o_stack.pop()?;
     }
 
-    let samples = unpack_samples(
-        data,
-        width as u32,
-        height as u32,
-        bps as u32,
-        ncomp as u32,
-        false,
-    );
+    let samples = unpack_samples(data, width as u32, height as u32, bps as u32, ncomp as u32);
     let cs = colorimage_color_space(ncomp);
     draw_image_to_device(
         ctx,
@@ -1430,14 +1460,7 @@ fn read_multi_source_data(
 ///
 /// The narrower `bps` paths still build a second buffer, but there the output
 /// is genuinely a different size from the input.
-fn unpack_samples(
-    raw: Vec<u8>,
-    width: u32,
-    height: u32,
-    bps: u32,
-    ncomp: u32,
-    indexed: bool,
-) -> Vec<u8> {
+fn unpack_samples(raw: Vec<u8>, width: u32, height: u32, bps: u32, ncomp: u32) -> Vec<u8> {
     if bps == 8 {
         return raw;
     }
@@ -1448,16 +1471,14 @@ fn unpack_samples(
     if bps == 16 {
         // 16-bit samples are two big-endian bytes, reduced to the nearest
         // 8-bit value, which is what the rest of the pipeline works in. An
-        // index is not scaled: it keeps its high byte, as indices past 255
-        // are beyond the 8-bit pipeline either way.
+        // Indexed image's samples are indices, read by
+        // `indexed_image_indices` instead.
         for i in 0..total_samples {
             let byte = |j: usize| raw.get(j).copied().unwrap_or(0);
-            let (hi, lo) = (byte(i * 2), byte(i * 2 + 1));
-            result.push(if indexed {
-                hi
-            } else {
-                to_8bit(u16::from_be_bytes([hi, lo]), 16)
-            });
+            result.push(to_8bit(
+                u16::from_be_bytes([byte(i * 2), byte(i * 2 + 1)]),
+                16,
+            ));
         }
     } else if bps == 12 {
         // 12-bit samples: each sample is 1.5 bytes
@@ -1482,13 +1503,8 @@ fn unpack_samples(
                     ((raw[byte_idx] as u16 & 0x0F) << 8)
                         | raw.get(byte_idx + 1).copied().unwrap_or(0) as u16
                 };
-                // Reduce 12-bit to the nearest 8-bit value; an index keeps
-                // its high bits, as for 16-bit.
-                result.push(if indexed {
-                    (sample >> 4) as u8
-                } else {
-                    to_8bit(sample, 12)
-                });
+                // Reduce 12-bit to the nearest 8-bit value.
+                result.push(to_8bit(sample, 12));
                 bit_pos += 12;
             }
         }
@@ -1507,18 +1523,94 @@ fn unpack_samples(
                 let bit_offset = (samples_per_byte - 1 - (s % samples_per_byte)) * bps as usize;
                 let byte_val = raw.get(byte_idx).copied().unwrap_or(0);
                 let sample = (byte_val >> bit_offset) & mask;
-                if indexed {
-                    // Indexed: raw value is palette index, don't scale
-                    result.push(sample);
-                } else {
-                    // Scale to 8-bit
-                    result.push((sample as f64 / max_val * 255.0).round() as u8);
-                }
+                // Scale to 8-bit
+                result.push((sample as f64 / max_val * 255.0).round() as u8);
             }
         }
     }
 
     result
+}
+
+/// An image's Decode when its dictionary gives none: 0 to 1 for each
+/// component, or 0 to 2^bps - 1 for an index, so that each sample is its
+/// index.
+fn default_decode(ncomp: u32, bps: u32, indexed: bool) -> Vec<f64> {
+    if indexed {
+        vec![0.0, ((1u32 << bps) - 1) as f64]
+    } else {
+        (0..ncomp).flat_map(|_| [0.0, 1.0]).collect()
+    }
+}
+
+/// The palette index of each sample of an image in an Indexed space
+/// (PLRM 3e §4.10.5): the sample through `decode`, rounded and clipped
+/// to 0 to `hival` as `setcolor` takes an index. One per pixel; a short
+/// buffer gives index 0.
+///
+/// A 12- or 16-bit index was cut to its high 8 bits, so index 5 of a
+/// 16-bit image was 0, and the Decode was not applied at all.
+fn indexed_image_indices(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    bps: u32,
+    decode: &[f64],
+    hival: u32,
+) -> Vec<u16> {
+    let max = (1u32 << bps) - 1;
+    let d0 = decode.first().copied().unwrap_or(0.0);
+    let d1 = decode.get(1).copied().unwrap_or(max as f64);
+    // Every possible sample's index, computed once.
+    let table: Vec<u16> = (0..=max)
+        .map(|v| {
+            (d0 + v as f64 * (d1 - d0) / max as f64)
+                .round()
+                .clamp(0.0, hival as f64) as u16
+        })
+        .collect();
+    let (width, height, bps) = (width as usize, height as usize, bps as usize);
+    let row_bits = (width * bps).div_ceil(8) * 8;
+    let sample = |bit: usize| -> usize {
+        match bps {
+            8 => raw.get(bit / 8).copied().unwrap_or(0) as usize,
+            16 => {
+                let at = bit / 8;
+                let byte = |j: usize| raw.get(j).copied().unwrap_or(0) as usize;
+                (byte(at) << 8) | byte(at + 1)
+            }
+            _ => (0..bps).fold(0, |v, k| {
+                let b = bit + k;
+                let byte = raw.get(b / 8).copied().unwrap_or(0);
+                (v << 1) | ((byte >> (7 - b % 8)) & 1) as usize
+            }),
+        }
+    };
+    let mut indices = Vec::with_capacity(width * height);
+    for row in 0..height {
+        for x in 0..width {
+            indices.push(table[sample(row * row_bits + x * bps)]);
+        }
+    }
+    indices
+}
+
+/// RGBA for an image in the current Indexed space, one pixel per index.
+fn indexed_rgba(ctx: &mut Context, indices: &[u16]) -> Vec<u8> {
+    let space = ctx.gstate.color_space.clone();
+    let palette = indexed_rgb_palette(ctx, &space);
+    let to_byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    let mut rgba = vec![255u8; indices.len() * 4];
+    for (px, &i) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(indices) {
+        let color = palette
+            .get(i as usize)
+            .cloned()
+            .unwrap_or_else(DeviceColor::black);
+        px[0] = to_byte(color.r);
+        px[1] = to_byte(color.g);
+        px[2] = to_byte(color.b);
+    }
+    rgba
 }
 
 /// Convert 8-bit samples to RGBA, applying decode array and color space conversion.
@@ -1534,51 +1626,12 @@ fn samples_to_rgba(
     let mut rgba = vec![255u8; pixel_count * 4]; // Pre-fill alpha = 255
     let intent = intent_from_byte(ctx.gstate.rendering_intent);
 
-    // Check for Indexed color space
-    if let ColorSpace::Indexed {
-        ref base,
-        hival,
-        ref lookup,
-        ..
-    } = ctx.gstate.color_space
-    {
-        // Each sample is an index into the lookup table
-        for i in 0..pixel_count {
-            let idx = samples.get(i).copied().unwrap_or(0) as usize;
-            let idx = idx.min(hival as usize);
-            let base_ncomp = match base.as_ref() {
-                ColorSpace::DeviceGray => 1,
-                ColorSpace::DeviceRGB => 3,
-                ColorSpace::DeviceCMYK => 4,
-                _ => 3,
-            };
-            let offset = idx * base_ncomp;
-            let color = match base.as_ref() {
-                ColorSpace::DeviceGray => {
-                    let g = lookup.get(offset).copied().unwrap_or(0) as f64 / 255.0;
-                    DeviceColor::from_gray(g)
-                }
-                ColorSpace::DeviceRGB => {
-                    let r = lookup.get(offset).copied().unwrap_or(0) as f64 / 255.0;
-                    let g = lookup.get(offset + 1).copied().unwrap_or(0) as f64 / 255.0;
-                    let b = lookup.get(offset + 2).copied().unwrap_or(0) as f64 / 255.0;
-                    DeviceColor::from_rgb(r, g, b)
-                }
-                ColorSpace::DeviceCMYK => {
-                    let c = lookup.get(offset).copied().unwrap_or(0) as f64 / 255.0;
-                    let m = lookup.get(offset + 1).copied().unwrap_or(0) as f64 / 255.0;
-                    let y = lookup.get(offset + 2).copied().unwrap_or(0) as f64 / 255.0;
-                    let k = lookup.get(offset + 3).copied().unwrap_or(0) as f64 / 255.0;
-                    DeviceColor::from_cmyk_icc_with_intent(c, m, y, k, intent, &mut ctx.icc_cache)
-                }
-                _ => DeviceColor::from_gray(0.0),
-            };
-            let pi = i * 4;
-            rgba[pi] = (color.r * 255.0).round().clamp(0.0, 255.0) as u8;
-            rgba[pi + 1] = (color.g * 255.0).round().clamp(0.0, 255.0) as u8;
-            rgba[pi + 2] = (color.b * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-        return rgba;
+    // Each sample is an index into the palette.
+    if let ColorSpace::Indexed { .. } = ctx.gstate.color_space {
+        let indices: Vec<u16> = (0..pixel_count)
+            .map(|i| samples.get(i).copied().unwrap_or(0) as u16)
+            .collect();
+        return indexed_rgba(ctx, &indices);
     }
 
     // ICC-based bulk image conversion
@@ -2040,7 +2093,13 @@ fn image_params(
 /// For CIE ABC/A, clones Arc params.
 /// For CIE DEF/DEFG and Separation/DeviceN, returns None (caller pre-converts).
 fn capture_image_color_space(ctx: &mut Context) -> Option<ImageColorSpace> {
-    match ctx.gstate.color_space.clone() {
+    let cs = ctx.gstate.color_space.clone();
+    capture_image_cs(ctx, cs)
+}
+
+/// [`capture_image_color_space`] for `cs`.
+fn capture_image_cs(ctx: &mut Context, cs: ColorSpace) -> Option<ImageColorSpace> {
+    match cs {
         ColorSpace::DeviceGray => Some(ImageColorSpace::DeviceGray),
         ColorSpace::DeviceRGB => Some(ImageColorSpace::DeviceRGB),
         ColorSpace::DeviceCMYK => Some(ImageColorSpace::DeviceCMYK),
@@ -2076,24 +2135,7 @@ fn capture_image_color_space(ctx: &mut Context) -> Option<ImageColorSpace> {
                 }
             }
         }
-        ColorSpace::Indexed {
-            base,
-            hival,
-            lookup,
-            ..
-        } => {
-            let base_cs = match base.as_ref() {
-                ColorSpace::DeviceGray => ImageColorSpace::DeviceGray,
-                ColorSpace::DeviceRGB => ImageColorSpace::DeviceRGB,
-                ColorSpace::DeviceCMYK => ImageColorSpace::DeviceCMYK,
-                _ => ImageColorSpace::DeviceRGB, // fallback
-            };
-            Some(ImageColorSpace::Indexed {
-                base: Box::new(base_cs),
-                hival,
-                lookup: lookup.clone(),
-            })
-        }
+        indexed @ ColorSpace::Indexed { .. } => indexed_image_space(ctx, &indexed),
         ColorSpace::CIEBasedABC { params, .. } => Some(ImageColorSpace::CIEBasedABC {
             params: params.clone(),
         }),
@@ -2107,7 +2149,13 @@ fn capture_image_color_space(ctx: &mut Context) -> Option<ImageColorSpace> {
             num_alt_components,
         } => {
             let alt_ics = alt_space_to_image_cs(&alt_space);
-            let table = sample_tint_transform(ctx, tint_transform, 1, num_alt_components)?;
+            let table = sample_device_tint_transform(
+                ctx,
+                tint_transform,
+                1,
+                &alt_space,
+                num_alt_components,
+            )?;
             Some(ImageColorSpace::Separation {
                 name,
                 alt_space: Box::new(alt_ics),
@@ -2124,8 +2172,13 @@ fn capture_image_color_space(ctx: &mut Context) -> Option<ImageColorSpace> {
             // More colorants than a table can span: `sample_tint_transform`
             // returns `None` and the caller falls back.
             let alt_ics = alt_space_to_image_cs(&alt_space);
-            let table =
-                sample_tint_transform(ctx, tint_transform, num_colorants, num_alt_components)?;
+            let table = sample_device_tint_transform(
+                ctx,
+                tint_transform,
+                num_colorants,
+                &alt_space,
+                num_alt_components,
+            )?;
             Some(ImageColorSpace::DeviceN {
                 names,
                 alt_space: Box::new(alt_ics),
@@ -2137,14 +2190,157 @@ fn capture_image_color_space(ctx: &mut Context) -> Option<ImageColorSpace> {
     }
 }
 
-/// Map a ColorSpace to the corresponding ImageColorSpace for alt-space usage.
-fn alt_space_to_image_cs(cs: &ColorSpace) -> ImageColorSpace {
-    match cs {
-        ColorSpace::DeviceGray => ImageColorSpace::DeviceGray,
-        ColorSpace::DeviceRGB => ImageColorSpace::DeviceRGB,
-        ColorSpace::DeviceCMYK => ImageColorSpace::DeviceCMYK,
-        _ => ImageColorSpace::DeviceRGB, // fallback
+/// An Indexed image's colour space as the renderer and the PDF writer read
+/// it: the palette's bytes over the base space when they are that space's
+/// components, else the palette converted to RGB.
+///
+/// A lookup string's bytes divided by 255 are the base's components (PLRM
+/// 3e §4.8.4), and the renderer reads 8-bit samples that way in a device
+/// space, a Separation or DeviceN one, and an ICCBased one whose `Range`
+/// is 0 to 1; such a base is kept, so PDF output keeps a spot colour's
+/// palette in its Separation space. A lookup procedure has been sampled
+/// into the bytes clipped to 0-1, which is what `setcolor` takes in those
+/// spaces. A CIE-based base, or an ICCBased one with another `Range`,
+/// takes components the bytes do not hold, so its palette is converted to
+/// RGB through it, entry by entry as `setcolor` converts one. The base
+/// was taken for DeviceRGB, and such a palette's bytes were drawn as RGB.
+fn indexed_image_space(ctx: &mut Context, space: &ColorSpace) -> Option<ImageColorSpace> {
+    let ColorSpace::Indexed {
+        base,
+        hival,
+        lookup,
+        ..
+    } = space
+    else {
+        return None;
+    };
+    let kept = match base.as_ref() {
+        ColorSpace::DeviceGray => Some(ImageColorSpace::DeviceGray),
+        ColorSpace::DeviceRGB => Some(ImageColorSpace::DeviceRGB),
+        ColorSpace::DeviceCMYK => Some(ImageColorSpace::DeviceCMYK),
+        ColorSpace::ICCBased { dict_entity, n, .. }
+            if crate::color_ops::icc_range(ctx, *dict_entity, *n)
+                .chunks(2)
+                .all(|r| r == [0.0, 1.0]) =>
+        {
+            capture_image_cs(ctx, (**base).clone())
+        }
+        ColorSpace::Separation { .. } | ColorSpace::DeviceN { .. } => {
+            capture_image_cs(ctx, (**base).clone())
+        }
+        _ => None,
+    };
+    if let Some(base_cs) = kept {
+        return Some(ImageColorSpace::Indexed {
+            base: Box::new(base_cs),
+            hival: *hival,
+            lookup: lookup.clone(),
+        });
     }
+    let to_byte = |v: f64| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    let lookup = indexed_rgb_palette(ctx, space)
+        .iter()
+        .flat_map(|c| [to_byte(c.r), to_byte(c.g), to_byte(c.b)])
+        .collect();
+    Some(ImageColorSpace::Indexed {
+        base: Box::new(ImageColorSpace::DeviceRGB),
+        hival: *hival,
+        lookup,
+    })
+}
+
+/// The device colour of each palette entry of an Indexed space, as
+/// `setcolor` gives it ([`crate::color_ops::resolve_components_color`]);
+/// black for an entry whose lookup procedure or tint transform fails.
+fn indexed_rgb_palette(ctx: &mut Context, space: &ColorSpace) -> Vec<DeviceColor> {
+    let ColorSpace::Indexed { hival, .. } = space else {
+        return Vec::new();
+    };
+    (0..=*hival)
+        .map(|i| {
+            crate::color_ops::resolve_components_color(ctx, &[i as f64], space)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| DeviceColor::black())
+        })
+        .collect()
+}
+
+/// The device space a Separation or DeviceN image's tint table is in; see
+/// [`tint_table_space`].
+fn alt_space_to_image_cs(cs: &ColorSpace) -> ImageColorSpace {
+    match tint_table_space(cs) {
+        TintTableSpace::Gray => ImageColorSpace::DeviceGray,
+        TintTableSpace::Rgb | TintTableSpace::ConvertedRgb => ImageColorSpace::DeviceRGB,
+        TintTableSpace::Cmyk => ImageColorSpace::DeviceCMYK,
+    }
+}
+
+/// The device space a tint table is read in, by its alternate space.
+pub(crate) enum TintTableSpace {
+    Gray,
+    Rgb,
+    Cmyk,
+    /// A CIE-based alternate: the table is converted to RGB when sampled.
+    ConvertedRgb,
+}
+
+/// The renderer, the overprint simulation and the PDF writer read a tint
+/// table as components of a device space. A device alternate is one; an
+/// ICCBased one is read as the device space of its size, as the PDF reader
+/// reads it, which keeps a CMYK alternate's values; a CIE-based one has
+/// its table converted to RGB (see [`sample_device_tint_transform`]).
+pub(crate) fn tint_table_space(alt: &ColorSpace) -> TintTableSpace {
+    match alt {
+        ColorSpace::DeviceGray => TintTableSpace::Gray,
+        ColorSpace::DeviceRGB => TintTableSpace::Rgb,
+        ColorSpace::DeviceCMYK => TintTableSpace::Cmyk,
+        ColorSpace::ICCBased { n: 1, .. } => TintTableSpace::Gray,
+        ColorSpace::ICCBased { n: 4, .. } => TintTableSpace::Cmyk,
+        ColorSpace::ICCBased { .. } => TintTableSpace::Rgb,
+        _ => TintTableSpace::ConvertedRgb,
+    }
+}
+
+/// [`sample_tint_transform`], with the table in a device space
+/// ([`tint_table_space`]).
+///
+/// When the alternate is CIE-based, each sample is converted to RGB
+/// through that space, as `setcolor` converts one colour, and the table
+/// has three outputs. Left as they were, a Lab alternate's L* a* b* were
+/// read as RGB, and a green spot colour came out magenta. The PDF reader
+/// converts such a table the same way.
+pub(crate) fn sample_device_tint_transform(
+    ctx: &mut Context,
+    tint_transform: PsObject,
+    num_inputs: u32,
+    alt_space: &ColorSpace,
+    num_alt_components: u32,
+) -> Option<stet_graphics::device::TintLookupTable> {
+    let table = sample_tint_transform(ctx, tint_transform, num_inputs, num_alt_components)?;
+    if !matches!(tint_table_space(alt_space), TintTableSpace::ConvertedRgb) {
+        return Some(table);
+    }
+    let intent = stet_graphics::icc::intent_from_byte(ctx.gstate.rendering_intent);
+    let n = num_alt_components.max(1) as usize;
+    let mut data = Vec::with_capacity(table.data.len() / n * 3);
+    let mut comps = vec![0.0f64; n];
+    for sample in table.data.chunks(n) {
+        for (c, &v) in comps.iter_mut().zip(sample) {
+            *c = v as f64;
+        }
+        let color = crate::color_ops::components_to_device_color(
+            &comps,
+            alt_space,
+            intent,
+            &mut ctx.icc_cache,
+        );
+        data.extend([color.r as f32, color.g as f32, color.b as f32]);
+    }
+    Some(stet_graphics::device::TintLookupTable {
+        num_outputs: 3,
+        data,
+        ..table
+    })
 }
 
 /// Sample a tint transform into a lookup table by evaluating it at grid points.
@@ -2336,7 +2532,7 @@ mod tests {
     #[test]
     fn test_unpack_8bit() {
         let data = vec![0, 128, 255];
-        let result = unpack_samples(data, 3, 1, 8, 1, false);
+        let result = unpack_samples(data, 3, 1, 8, 1);
         assert_eq!(result, vec![0, 128, 255]);
     }
 
@@ -2350,7 +2546,7 @@ mod tests {
     fn test_unpack_8bit_does_not_copy() {
         let data = vec![7u8; 4096];
         let original = data.as_ptr();
-        let result = unpack_samples(data, 1024, 1, 8, 4, false);
+        let result = unpack_samples(data, 1024, 1, 8, 4);
         assert_eq!(
             result.as_ptr(),
             original,
@@ -2362,7 +2558,7 @@ mod tests {
     fn test_unpack_1bit() {
         // 0b10110000 = 0xB0 → samples: 1,0,1,1,0,0,0,0
         let data = vec![0xB0];
-        let result = unpack_samples(data, 4, 1, 1, 1, false);
+        let result = unpack_samples(data, 4, 1, 1, 1);
         // 1 bit: 1→255, 0→0
         assert_eq!(result[0], 255); // bit 1
         assert_eq!(result[1], 0); // bit 0
@@ -2374,7 +2570,7 @@ mod tests {
     fn test_unpack_4bit() {
         // 0xAC → high nibble 0xA=10, low nibble 0xC=12
         let data = vec![0xAC];
-        let result = unpack_samples(data, 2, 1, 4, 1, false);
+        let result = unpack_samples(data, 2, 1, 4, 1);
         // 10/15 * 255 = 170, 12/15 * 255 = 204
         assert_eq!(result[0], 170);
         assert_eq!(result[1], 204);
@@ -2387,16 +2583,8 @@ mod tests {
     #[test]
     fn test_unpack_16bit() {
         let data = vec![0x00, 0x00, 0x10, 0xFF, 0x81, 0x00, 0x81, 0x01, 0xFF, 0x01];
-        let result = unpack_samples(data, 5, 1, 16, 1, false);
+        let result = unpack_samples(data, 5, 1, 16, 1);
         assert_eq!(result, vec![0x00, 0x11, 0x80, 0x81, 0xFE]);
-    }
-
-    /// An index is not scaled: a 16-bit one keeps its high byte.
-    #[test]
-    fn test_unpack_16bit_indexed() {
-        let data = vec![0x10, 0xFF, 0xFF, 0x01];
-        let result = unpack_samples(data, 2, 1, 16, 1, true);
-        assert_eq!(result, vec![0x10, 0xFF]);
     }
 
     /// 12-bit samples, two to three bytes, reduce to the nearest 8-bit
@@ -2404,18 +2592,51 @@ mod tests {
     #[test]
     fn test_unpack_12bit() {
         let data = vec![0x10, 0xF1, 0x08];
+        assert_eq!(unpack_samples(data, 2, 1, 12, 1), vec![17, 16]);
+    }
+
+    /// An index is the sample through the Decode, not a reduced sample: a
+    /// 16-bit 5 is index 5, where cutting to the high byte gave 0.
+    #[test]
+    fn test_indexed_indices_16bit() {
+        let data = vec![0x00, 0x05, 0x0F, 0xFF, 0xFF, 0xFF];
         assert_eq!(
-            unpack_samples(data.clone(), 2, 1, 12, 1, false),
-            vec![17, 16]
+            indexed_image_indices(&data, 3, 1, 16, &[0.0, 65535.0], 4095),
+            vec![5, 4095, 4095]
         );
-        assert_eq!(unpack_samples(data, 2, 1, 12, 1, true), vec![0x10, 0x10]);
+    }
+
+    /// 12-bit indices across a byte boundary, each row starting on a byte.
+    #[test]
+    fn test_indexed_indices_12bit_rows() {
+        // Row 0: 0x123; row 1: 0xABC, each padded to two bytes.
+        let data = vec![0x12, 0x30, 0xAB, 0xC0];
+        assert_eq!(
+            indexed_image_indices(&data, 1, 2, 12, &[0.0, 4095.0], 4095),
+            vec![0x123, 0xABC]
+        );
+    }
+
+    /// The Decode maps a sample to an index, rounded and clipped to hival.
+    #[test]
+    fn test_indexed_indices_decode() {
+        // 2-bit samples 0 1 2 3 over [5 0]: 5, 3.33, 1.67, 0.
+        assert_eq!(
+            indexed_image_indices(&[0x1B], 4, 1, 2, &[5.0, 0.0], 5),
+            vec![5, 3, 2, 0]
+        );
+        // Past hival is clipped to it.
+        assert_eq!(
+            indexed_image_indices(&[0x00, 0xC8], 2, 1, 8, &[0.0, 255.0], 3),
+            vec![0, 3]
+        );
     }
 
     /// A short buffer pads with zero rather than panicking.
     #[test]
     fn test_unpack_16bit_truncated() {
         let data = vec![0x12, 0x34, 0x56];
-        let result = unpack_samples(data, 2, 1, 16, 1, false);
+        let result = unpack_samples(data, 2, 1, 16, 1);
         assert_eq!(result, vec![0x12, 0x56]);
     }
 

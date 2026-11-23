@@ -13,6 +13,7 @@ use std::io::Write;
 
 use stet_core::context::Context;
 use stet_core::error::PsError;
+use stet_core::file_access::Access;
 use stet_core::file_store;
 use stet_core::object::{EntityId, ObjFlags, PsObject, PsValue};
 
@@ -27,11 +28,17 @@ use crate::type_ops::write_obj_equal;
 /// 2. Exec stack walk → scan for File entries, try parent directory of innermost real file
 /// 3. Resource base path → try `resource_base_path/filename`
 /// 4. Return original → let the caller produce the appropriate error
+///
+/// Only paths the context's [`HostPolicy`](stet_core::file_access::HostPolicy)
+/// lets a program see are tried, so under `Safer` which path is chosen
+/// says nothing about files outside the permits.
 pub(crate) fn resolve_filename(ctx: &Context, filename: &str) -> String {
     let path = Path::new(filename);
+    let policy = ctx.host_policy();
+    let visible = |p: &Path| policy.sees(p) && p.exists();
 
     // 1. Absolute or already exists
-    if path.is_absolute() || path.exists() {
+    if path.is_absolute() || visible(path) {
         return filename.to_string();
     }
 
@@ -47,7 +54,7 @@ pub(crate) fn resolve_filename(ctx: &Context, filename: &str) -> String {
             }
             if let Some(parent) = Path::new(name).parent() {
                 let candidate = parent.join(filename);
-                if candidate.exists() {
+                if visible(&candidate) {
                     return candidate.to_string_lossy().to_string();
                 }
             }
@@ -60,7 +67,7 @@ pub(crate) fn resolve_filename(ctx: &Context, filename: &str) -> String {
     if let Some(ref base) = ctx.resource_base_path {
         let relative = filename.strip_prefix("resources/").unwrap_or(filename);
         let candidate = Path::new(base).join(relative);
-        if candidate.exists() {
+        if visible(&candidate) {
             return candidate.to_string_lossy().to_string();
         }
     }
@@ -164,13 +171,21 @@ pub fn op_file(ctx: &mut Context) -> Result<(), PsError> {
     // Resolve relative paths against the currently executing file's directory
     let resolved = resolve_filename(ctx, &name);
 
-    let file_entity = ctx.files.open(&resolved, &mode).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            PsError::UndefinedFilename
-        } else {
-            PsError::InvalidFileAccess
-        }
-    })?;
+    let policy = stet_core::file_access::HostPolicy::new(
+        ctx.file_access,
+        &ctx.file_permits,
+        ctx.resource_base_path.as_deref(),
+    );
+    let file_entity = ctx
+        .files
+        .open_with(&resolved, &mode, &policy)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                PsError::UndefinedFilename
+            } else {
+                PsError::InvalidFileAccess
+            }
+        })?;
 
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
@@ -698,13 +713,13 @@ pub fn op_status(ctx: &mut Context) -> Result<(), PsError> {
             // Check embedded files first (for WASM builds)
             let exists = if ctx.files.get_embedded_file(&path).is_some() {
                 true
-            } else if !stet_fonts::host::host_access_allowed() {
-                false
             } else {
                 // resolve_filename returns the original if nothing matched,
-                // so check whether the resolved path actually exists
+                // so check whether the resolved path actually exists. A
+                // path the program may not see does not exist for it.
                 let resolved = resolve_filename(ctx, &path);
-                Path::new(&resolved).exists()
+                let resolved = Path::new(&resolved);
+                ctx.host_policy().sees(resolved) && resolved.exists()
             };
             ctx.o_stack.pop()?;
             if exists {
@@ -747,7 +762,9 @@ pub fn op_deletefile(ctx: &mut Context) -> Result<(), PsError> {
         return Err(PsError::InvalidFileAccess);
     }
 
-    if !stet_fonts::host::host_access_allowed() {
+    // Before the disk is touched, so the refusal does not depend on
+    // whether the file exists.
+    if !ctx.host_policy().allows(Path::new(&path), Access::Control) {
         return Err(PsError::InvalidFileAccess);
     }
     ctx.o_stack.pop()?;
@@ -791,8 +808,15 @@ pub fn op_renamefile(ctx: &mut Context) -> Result<(), PsError> {
     }
 
     // Before the existence check: otherwise undefinedfilename versus
-    // invalidfileaccess tells a sandboxed document whether a path exists.
-    if !stet_fonts::host::host_access_allowed() {
+    // invalidfileaccess tells a document whether a path exists. Renaming
+    // removes the old name from its folder and creates the new one in
+    // its, and may replace a file there: control on both, write on the new.
+    let policy = ctx.host_policy();
+    let (old_path, new_path) = (Path::new(&old_name), Path::new(&new_name));
+    if !(policy.allows(old_path, Access::Control)
+        && policy.allows(new_path, Access::Control)
+        && policy.allows(new_path, Access::Write))
+    {
         return Err(PsError::InvalidFileAccess);
     }
 
@@ -800,7 +824,6 @@ pub fn op_renamefile(ctx: &mut Context) -> Result<(), PsError> {
     if !std::path::Path::new(&old_name).exists() {
         return Err(PsError::UndefinedFilename);
     }
-
     ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
     std::fs::rename(&old_name, &new_name).map_err(|_| PsError::UndefinedFilename)?;
@@ -808,7 +831,13 @@ pub fn op_renamefile(ctx: &mut Context) -> Result<(), PsError> {
 }
 
 /// `filenameforall`: template proc scratch → —
-/// Simplified: enumerate files matching a glob pattern.
+///
+/// Calls `proc` with the name of each host file `template` matches, in byte
+/// order. The template follows the PLRM: `*` matches any run of characters
+/// within one path component, `?` one character, and `\` makes the next one
+/// literal; on Windows `\` separates components instead, as `/` does. Each
+/// name keeps the template's own spelling, separators included, with only
+/// its wildcard components replaced by what they matched.
 pub fn op_filenameforall(ctx: &mut Context) -> Result<(), PsError> {
     if ctx.o_stack.len() < 3 {
         return Err(PsError::StackUnderflow);
@@ -826,35 +855,46 @@ pub fn op_filenameforall(ctx: &mut Context) -> Result<(), PsError> {
         return Err(PsError::TypeCheck);
     }
     let template = match template_obj.value {
-        PsValue::String { entity, start, len } => {
-            String::from_utf8_lossy(ctx.strings.get(entity, start, len)).into_owned()
-        }
+        PsValue::String { entity, start, len } => ctx.strings.get(entity, start, len).to_vec(),
         _ => return Err(PsError::TypeCheck),
     };
+    // The template is read and the scratch string written (PLRM: invalidaccess).
+    if template_obj.flags.access() < ObjFlags::ACCESS_READ_ONLY
+        || scratch_obj.flags.access() < ObjFlags::ACCESS_WRITE_ONLY
+    {
+        return Err(PsError::InvalidAccess);
+    }
 
     ctx.o_stack.pop()?;
     let proc = ctx.o_stack.pop()?;
     ctx.o_stack.pop()?;
 
-    // Use glob to expand the template pattern
-    let mut matches: Vec<String> = Vec::new();
-    if !stet_fonts::host::host_access_allowed() {
-        // Only embedded resources exist when the host is off limits.
-    } else if let Ok(paths) = glob::glob(&template) {
-        for path in paths.flatten() {
-            matches.push(path.to_string_lossy().into_owned());
-        }
-    }
-    matches.sort();
+    // Each name is spelled as the template spells it (crate::template), so a
+    // program gets back the separators it wrote on every system. Only paths
+    // the program may see: nothing on the host once deny_host_access was
+    // called, and under Safer only what is permitted.
+    let matches: Vec<Vec<u8>> = if stet_fonts::host::host_access_allowed() {
+        let policy = ctx.host_policy();
+        crate::template::matching_files(&template)
+            .into_iter()
+            .filter(|name| policy.sees(&crate::template::host_path(name)))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Execute callback for each match
-    for name in &matches {
-        let name_bytes = name.as_bytes();
-        let copy_len = name_bytes.len().min(scratch_len as usize);
+    for name_bytes in &matches {
+        // A name the scratch string cannot hold is a rangecheck (PLRM), as
+        // in Ghostscript, not a truncated name that names some other file.
+        if name_bytes.len() > scratch_len as usize {
+            return Err(PsError::RangeCheck);
+        }
+        let copy_len = name_bytes.len();
         let scratch_slice = ctx
             .strings
             .get_mut(scratch_entity, scratch_start, scratch_len);
-        scratch_slice[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+        scratch_slice[..copy_len].copy_from_slice(name_bytes);
 
         let str_obj = PsObject {
             value: PsValue::String {
