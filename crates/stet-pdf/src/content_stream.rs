@@ -17,9 +17,9 @@ use crate::text_ops;
 use stet_fonts::geometry::{Matrix, PsPath};
 use stet_graphics::color::{DeviceColor, FillRule, LineCap, LineJoin};
 use stet_graphics::device::{
-    AxialShadingParams, BgUcrState, HalftoneState, MeshShadingParams, PatchShadingParams,
-    PatternFillParams, RadialShadingParams, SpotColor, SpotColorSpace, StrokeParams, TextParams,
-    TransferState,
+    AxialShadingParams, BgUcrState, HalftoneState, ImageColorSpace, MeshShadingParams,
+    PatchShadingParams, PatternFillParams, RadialShadingParams, SpotColor, SpotColorSpace,
+    StrokeParams, TextParams, TransferState,
 };
 use stet_graphics::display_list::{DisplayElement, DisplayList};
 
@@ -800,11 +800,24 @@ impl<'tracker> Builder<'tracker> {
                 sample_data,
                 params,
             } => {
-                // An image kept as JPEG data has no samples: decode it. One
-                // that doesn't decode to its size is left out, as the `image`
+                // An image kept as JPEG data has no samples. In DeviceGray or
+                // DeviceRGB it goes out as its JPEG (DCTDecode), which
+                // convert_image writes; otherwise it is decoded here. One that
+                // doesn't decode to its size is left out, as the `image`
                 // operator would have stopped on it.
-                let Some(sample_data) = params.samples(sample_data) else {
-                    return;
+                let as_jpeg = sample_data.is_empty()
+                    && params.jpeg.is_some()
+                    && matches!(
+                        params.color_space,
+                        ImageColorSpace::DeviceGray | ImageColorSpace::DeviceRGB
+                    );
+                let sample_data = if as_jpeg {
+                    std::borrow::Cow::Borrowed(&sample_data[..])
+                } else {
+                    let Some(samples) = params.samples(sample_data) else {
+                        return;
+                    };
+                    samples
                 };
                 let img_idx = self.images.len();
                 let xobj = image_ops::convert_image(&sample_data, params);

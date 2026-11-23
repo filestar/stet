@@ -245,7 +245,33 @@ fn a_kept_jpeg_renders_and_writes_as_without_the_switch() {
         };
         builder.build().render_to_pdf(src.as_bytes(), 72.0).unwrap()
     };
-    assert!(undated(pdf(true)) == undated(pdf(false)), "the same PDF");
+    // filestar fork: the PDF writer writes a kept DeviceRGB/DeviceGray JPEG
+    // out as it is (DCTDecode) instead of decoding it.
+    let (kept, plain) = (pdf(true), pdf(false));
+    let has = |pdf: &[u8], s: &[u8]| pdf.windows(s.len()).any(|w| w == s);
+    assert!(has(&kept, b"/DCTDecode"), "kept: DCTDecode");
+    assert!(has(&kept, &bytes(RGB)), "kept: the file's own JPEG");
+    assert!(!has(&plain, b"/DCTDecode"), "without the switch: decoded");
+    assert!(
+        undated(plain.clone()) == undated(pdf(false)),
+        "deterministic"
+    );
+}
+
+/// filestar fork: a kept greyscale JPEG goes into the PDF as it is too.
+#[test]
+fn a_kept_greyscale_jpeg_writes_as_dctdecode() {
+    let src = format!(
+        "%!PS-Adobe-3.0\n{}\nshowpage\n",
+        inline("DeviceGray", 8, 8, "0 1", GRAY)
+    );
+    let pdf = Interpreter::builder()
+        .keep_jpeg_data()
+        .build()
+        .render_to_pdf(src.as_bytes(), 72.0)
+        .unwrap();
+    let has = |s: &[u8]| pdf.windows(s.len()).any(|w| w == s);
+    assert!(has(b"/DCTDecode") && has(&bytes(GRAY)), "grey JPEG kept");
 }
 
 /// A PDF with its `/CreationDate` value left out: two runs can be a second
