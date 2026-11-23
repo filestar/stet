@@ -2079,15 +2079,31 @@ fn read_font_matrix(ctx: &Context, dict_entity: EntityId) -> Matrix {
     }
 }
 
-/// Concatenate the sfnts array from a Type 42 / CIDFont dictionary into raw font data.
-fn concatenate_sfnts_array(ctx: &Context, dict_entity: EntityId) -> Option<Vec<u8>> {
+/// The font file of a Type 42 font or Type 2 CIDFont: its `sfnts` strings
+/// joined, once per `sfnts` array ([`Context::sfnts_cache`], which a
+/// `restore` drops with the array).
+fn concatenate_sfnts_array(ctx: &Context, dict_entity: EntityId) -> Option<Arc<[u8]>> {
     let sfnts_name = ctx.names.find(b"sfnts")?;
     let sfnts_obj = ctx.dicts.get(dict_entity, &DictKey::Name(sfnts_name))?;
-    let (arr_entity, arr_start, arr_len) = match sfnts_obj.value {
+    let key = match sfnts_obj.value {
         PsValue::Array { entity, start, len } => (entity, start, len),
         _ => return None,
     };
+    if let Some(data) = ctx.sfnts_cache.lock().ok()?.get(&key) {
+        return Some(Arc::clone(data));
+    }
+    let data: Arc<[u8]> = join_sfnts_array(ctx, key)?.into();
+    if let Ok(mut cache) = ctx.sfnts_cache.lock() {
+        cache.insert(key, Arc::clone(&data));
+    }
+    Some(data)
+}
 
+/// Concatenate an sfnts array into raw font data.
+fn join_sfnts_array(
+    ctx: &Context,
+    (arr_entity, arr_start, arr_len): (EntityId, u32, u32),
+) -> Option<Vec<u8>> {
     let mut strings: Vec<&[u8]> = Vec::new();
     for i in 0..arr_len {
         let elem = ctx.arrays.get_element(arr_entity, arr_start + i);
@@ -2899,7 +2915,7 @@ fn font_wmode(ctx: &Context, font_entity: EntityId) -> i32 {
 /// used to access GlyphDirectory is obtained from the CIDMap table" (PLRM
 /// Table 5.17). Outlines and advances are in font units.
 struct TrueTypeCid {
-    font_data: Option<Vec<u8>>,
+    font_data: Option<Arc<[u8]>>,
     glyph_dir: Option<EntityId>,
     cid_map: crate::cid_ops::CidToGid,
     /// The font's units per em.
@@ -4466,7 +4482,7 @@ fn render_charpath_composite(
                         && glyf_bytes.len() >= 10
                     {
                         let glyf_path = {
-                            let fd_ref = Some(fd.as_slice());
+                            let fd_ref = Some(&fd[..]);
                             let resolver = |gid: u16| -> Option<Vec<u8>> {
                                 fd_ref.and_then(|fd| truetype::get_glyf_data(fd, gid))
                             };

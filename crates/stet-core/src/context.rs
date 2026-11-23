@@ -121,6 +121,10 @@ struct GstateBackup {
     state: GraphicsState,
 }
 
+/// [`Context::sfnts_cache`]: a font file by its `sfnts` array (entity, start,
+/// length).
+pub type SfntsCache = rustc_hash::FxHashMap<(EntityId, u32, u32), std::sync::Arc<[u8]>>;
+
 pub struct Context {
     // Stacks
     pub o_stack: Stack,
@@ -358,6 +362,13 @@ pub struct Context {
     /// Each CMap's codespace and CID mappings, by CMap dictionary, read the
     /// first time text is shown with it (see [`crate::cmap`]).
     pub cmap_tables: rustc_hash::FxHashMap<EntityId, std::sync::Arc<crate::cmap::CmapTables>>,
+    /// Type 42 and Type 2 CIDFont font files: each `sfnts` array (entity,
+    /// start, length) joined once, not once per `show`. Keyed by the array,
+    /// not the font, because `scalefont` and `makefont` copy the font
+    /// dictionary but share the array: a 4 MB CJK font shown a glyph at a
+    /// time otherwise copied 4 MB per glyph. Behind a lock because the show
+    /// operators only borrow the context.
+    pub sfnts_cache: std::sync::Mutex<SfntsCache>,
     /// The Type 0 font `glyphshow` shows a CID through, by CIDFont: the
     /// CIDFont composed with Identity-H (Identity-V for WMode 1), once.
     pub cid_glyphshow_fonts: rustc_hash::FxHashMap<EntityId, PsObject>,
@@ -1454,6 +1465,7 @@ impl Context {
             char_width_mode1: None,
             glyph_caches: rustc_hash::FxHashMap::default(),
             cmap_tables: rustc_hash::FxHashMap::default(),
+            sfnts_cache: std::sync::Mutex::default(),
             cid_glyphshow_fonts: rustc_hash::FxHashMap::default(),
             cid_glyph_metrics: rustc_hash::FxHashMap::default(),
             font_snapshots: crate::font_snapshot::FontSnapshots::default(),
@@ -1897,6 +1909,10 @@ impl Context {
         let live_dict = |e: &EntityId| e.is_global() || e.raw_index() < dict_mark;
         self.glyph_caches.retain(|entity, _| live_dict(entity));
         self.cmap_tables.retain(|entity, _| live_dict(entity));
+        let array_mark = marks.array_entities;
+        if let Ok(sfnts) = self.sfnts_cache.get_mut() {
+            sfnts.retain(|(e, _, _), _| e.is_global() || e.raw_index() < array_mark);
+        }
         self.cid_glyphshow_fonts.retain(|cidfont, font| {
             live_dict(cidfont) && matches!(font.value, PsValue::Dict(e) if live_dict(&e))
         });
