@@ -99,7 +99,11 @@ fn sfnt_tables(cmap: Option<Vec<u8>>, outlines: bool) -> Vec<u8> {
     } else {
         tables.extend([(b"gdir", &[][..])]);
     }
-    tables.extend([(b"head", head.as_slice()), (b"hhea", &hhea), (b"hmtx", &hmtx)]);
+    tables.extend([
+        (b"head", head.as_slice()),
+        (b"hhea", &hhea),
+        (b"hmtx", &hmtx),
+    ]);
     if outlines {
         tables.extend([(b"loca", loca.as_slice())]);
     }

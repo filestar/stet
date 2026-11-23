@@ -127,7 +127,13 @@ pub fn convert_image(sample_data: &[u8], params: &ImageParams) -> ImageXObject {
             };
         }
         if let Ok(px) = stet_graphics::jpeg::decode(jpeg) {
-            return convert_image(&px, &ImageParams { jpeg: None, ..params.clone() });
+            return convert_image(
+                &px,
+                &ImageParams {
+                    jpeg: None,
+                    ..params.clone()
+                },
+            );
         }
     }
     match &params.color_space {

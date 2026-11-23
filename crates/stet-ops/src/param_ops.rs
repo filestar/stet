@@ -218,10 +218,12 @@ pub fn op_currentdistillerparams(ctx: &mut Context) -> Result<(), PsError> {
     let compat = ctx.names.intern(b"CompatibilityLevel");
     ctx.dicts.put(d, DictKey::Name(compat), PsObject::real(1.7));
     let preserve = ctx.names.intern(b"PreserveOverprintSettings");
-    ctx.dicts.put(d, DictKey::Name(preserve), PsObject::bool(true));
+    ctx.dicts
+        .put(d, DictKey::Name(preserve), PsObject::bool(true));
     let strategy = ctx.names.intern(b"ColorConversionStrategy");
     let unchanged = ctx.names.intern(b"LeaveColorUnchanged");
-    ctx.dicts.put(d, DictKey::Name(strategy), PsObject::name_lit(unchanged));
+    ctx.dicts
+        .put(d, DictKey::Name(strategy), PsObject::name_lit(unchanged));
     ctx.o_stack.push(PsObject::dict(d))?;
     Ok(())
 }

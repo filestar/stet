@@ -16,10 +16,15 @@ const JOB: &str = "%!PS\n<< /PageSize [200 200] >> setpagedevice\n\
 
 #[test]
 fn a_custom_colour_is_a_separation_in_a_pdf() {
-    let pdf = Interpreter::new().render_to_pdf(JOB.as_bytes(), 72.0).unwrap();
+    let pdf = Interpreter::new()
+        .render_to_pdf(JOB.as_bytes(), 72.0)
+        .unwrap();
     let text = String::from_utf8_lossy(&pdf);
     assert!(text.contains("/Separation"), "a Separation colour space");
-    assert!(text.contains("PANTONE#20185#20C"), "named after the custom colour");
+    assert!(
+        text.contains("PANTONE#20185#20C"),
+        "named after the custom colour"
+    );
 }
 
 #[test]
