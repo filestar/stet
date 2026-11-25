@@ -1206,6 +1206,14 @@ fn replay_form_elements(
         result
     };
 
+    // A Type 3 glyph kept as text counts the elements after its `Text`;
+    // the loop below drops these two, so where the form has one its glyphs
+    // are drawn as outlines rather than counted wrong.
+    let drops_elements = cached
+        .elements()
+        .iter()
+        .any(|e| matches!(e, DisplayElement::ErasePage | DisplayElement::InitClip));
+
     for elem in cached.elements() {
         match elem {
             DisplayElement::Fill { path, params } => {
@@ -1348,6 +1356,12 @@ fn replay_form_elements(
                     composed.tx,
                     composed.ty,
                 ];
+                if let Some(t3) = new_params.type3.as_mut() {
+                    t3.glyph_to_device = ctm.concat(&t3.glyph_to_device);
+                }
+                if drops_elements {
+                    new_params.type3 = None;
+                }
                 target.push(DisplayElement::Text { params: new_params });
             }
             DisplayElement::TextRun { params } => {

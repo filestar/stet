@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PDF output keeps text in PostScript Type 3 fonts as text**, in PDF
+  Type 3 fonts. It used to draw each glyph as the marks its `BuildChar` or
+  `BuildGlyph` procedure made, so the PDF had no text in such a font: none
+  to search, copy or extract. Each glyph's marks are now mapped back into
+  glyph space and become its procedure in the font's `/CharProcs` — `d1`
+  for a `setcachedevice` glyph, a stencil in the text's colour, `d0` with
+  its own colours after `setcharwidth` — with `/Widths` from the glyph's
+  width, an `/Encoding` and a `/ToUnicode` CMap from the glyph names, and
+  the text shown with `Tj`. Filled paths, strokes, stencil masks (bitmap
+  fonts) and, in a `d0` glyph, small images are kept, the images inline.
+  A glyph with anything else — a shading, a pattern, a clip, a group,
+  transparency, overprint, a spot or ICC colour, text in another font —
+  or text painted with a pattern, stroked or translucent, is drawn as
+  before; only that glyph. The procedures are in glyph space, so one PDF
+  font serves every size and rotation of a font; showings that draw a code
+  differently go to another font of the same name. New:
+  `stet_graphics::device::Type3Glyph` and `TextParams::type3`, which the
+  interpreter sets on a `Text` element it puts before each Type 3 glyph's
+  marks, for a device that keeps text fonts (`keeps_text_fonts`). The
+  marks stay on the display list, so every other device draws them as
+  before.
+
 ### Changed
 
 - **`stet_core::file_store::FileHandle::StringSource`'s `data` is an

@@ -735,6 +735,7 @@ impl PdfDevice {
             };
             map.insert(usage.pdf_name.clone(), font_ref);
         }
+        map.extend(font_tracker.type3.write(writer));
         map
     }
 
@@ -1532,7 +1533,10 @@ fn build_spot_colorspace(
 }
 
 /// Generate a ToUnicode CMap stream.
-fn generate_tounicode_cmap(map: &std::collections::HashMap<u16, u16>, font_name: &str) -> Vec<u8> {
+pub(crate) fn generate_tounicode_cmap(
+    map: &std::collections::HashMap<u16, u16>,
+    font_name: &str,
+) -> Vec<u8> {
     use std::io::Write;
     let mut buf = Vec::new();
 
