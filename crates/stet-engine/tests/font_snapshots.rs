@@ -341,7 +341,12 @@ fn a_cached_type3_glyph_keeps_its_instance() {
             subset_font("Inner", "/A")
         ),
     );
-    let texts = texts(&pages);
+    // The inner font's text; the Type 3 glyph has a `Text` of its own, which
+    // carries its marks rather than a copy of its font.
+    let texts: Vec<TextParams> = texts(&pages)
+        .into_iter()
+        .filter(|t| t.font_type != 3)
+        .collect();
     assert_eq!(texts.len(), 2);
     let id = texts[0].font_snapshot.unwrap();
     assert_eq!(

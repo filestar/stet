@@ -42,6 +42,7 @@ mod pdf_objects;
 mod pdf_writer;
 mod shading_ops;
 mod text_ops;
+mod type3;
 mod unicode_mapping;
 
 pub use pdf_device::PdfDevice;

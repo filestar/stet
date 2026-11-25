@@ -428,6 +428,71 @@ pub struct TextParams {
     pub alpha_is_shape: bool,
     /// Text knockout (PDF `TK`). Default true.
     pub text_knockout: bool,
+    /// For one glyph of a Type 3 font: what its glyph procedure drew, so a
+    /// PDF writer can keep the glyph as text in a PDF Type 3 font. `None`
+    /// for every other font.
+    pub type3: Option<Box<Type3Glyph>>,
+}
+
+/// One glyph of a PostScript Type 3 font, shown as text.
+///
+/// The glyph procedure's marks are not in here: they follow the
+/// [`Text`](crate::display_list::DisplayElement::Text) element in the same
+/// display list, [`elements`](Self::elements) of them, in device space like
+/// every other element, so a device that ignores text still draws them. A
+/// device that keeps the glyph as text draws it from those elements, mapped
+/// back into glyph space with [`glyph_to_device`](Self::glyph_to_device),
+/// and skips them; one that cannot falls back to drawing them as they are.
+///
+/// New fields may be added without notice.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Type3Glyph {
+    /// Glyph space → device space for this showing of the glyph: the
+    /// font's `FontMatrix`, the move to the current point and the CTM.
+    pub glyph_to_device: Matrix,
+    /// The font's `FontMatrix` (glyph space → user space).
+    pub font_matrix: Matrix,
+    /// The glyph's width in glyph space, from `setcachedevice` or
+    /// `setcharwidth`.
+    pub width: (f64, f64),
+    /// The `setcachedevice` bounding box in glyph space; `None` after
+    /// `setcharwidth`.
+    pub bbox: Option<[f64; 4]>,
+    /// The glyph is a stencil painted in the current colour
+    /// (`setcachedevice`), rather than carrying its own colours
+    /// (`setcharwidth`).
+    pub stencil: bool,
+    /// The glyph's name in the font's `Encoding`, when it has one.
+    pub glyph_name: Option<Vec<u8>>,
+    /// How many elements after the `Text` draw the glyph.
+    pub elements: usize,
+}
+
+impl Type3Glyph {
+    /// A glyph drawn by the `elements` elements after its `Text`, with
+    /// glyph space mapped to device space by `glyph_to_device`. The
+    /// struct is `#[non_exhaustive]`, so outside this crate it is made
+    /// here.
+    pub fn new(
+        glyph_to_device: Matrix,
+        font_matrix: Matrix,
+        width: (f64, f64),
+        bbox: Option<[f64; 4]>,
+        stencil: bool,
+        glyph_name: Option<Vec<u8>>,
+        elements: usize,
+    ) -> Self {
+        Self {
+            glyph_to_device,
+            font_matrix,
+            width,
+            bbox,
+            stencil,
+            glyph_name,
+            elements,
+        }
+    }
 }
 
 /// Parameters for a [`TextRun`](crate::display_list::DisplayElement::TextRun)
@@ -1373,6 +1438,7 @@ impl Default for TextParams {
             blend_mode: 0,
             alpha_is_shape: false,
             text_knockout: true,
+            type3: None,
         }
     }
 }
