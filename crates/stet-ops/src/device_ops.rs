@@ -116,7 +116,13 @@ pub fn get_pd_value(ctx: &Context, key: &[u8]) -> Option<PsObject> {
 /// propagating: a NaN width would otherwise reach the renderer as a zero or
 /// garbage pixel count.
 fn clamp_page_size(ctx: &Context, width: f64, height: f64) -> (f64, f64) {
-    let limit = ctx.max_page_size_points;
+    // A limit that is not greater than zero (NaN included) would empty or
+    // unclamp every page: the field is public, so fall back to the default.
+    let limit = if ctx.max_page_size_points > 0.0 {
+        ctx.max_page_size_points
+    } else {
+        stet_core::context::DEFAULT_MAX_PAGE_SIZE_POINTS
+    };
     let clamp_one = |v: f64, fallback: f64| {
         if !v.is_finite() || v <= 0.0 {
             fallback
@@ -225,7 +231,12 @@ pub fn op_setpagedevice(ctx: &mut Context) -> Result<(), PsError> {
             ];
             let proc_entity = crate::vm_ops::alloc_array_from(ctx, &proc_elements);
             let proc_obj = PsObject::procedure(proc_entity, proc_elements.len() as u32);
-            let dev_entity = if ctx.exec_sync(proc_obj).is_ok() {
+            // A device with no resource falls back to the request alone, so
+            // whatever `findresource` leaves when it fails (its key and
+            // category) is dropped: the program's stack is as it was.
+            let depth = ctx.o_stack.len();
+            let found = ctx.exec_sync(proc_obj).is_ok() && ctx.o_stack.len() > depth;
+            let dev_entity = if found {
                 ctx.o_stack.pop().ok().and_then(|obj| {
                     if let PsValue::Dict(e) = obj.value {
                         Some(e)
@@ -236,6 +247,7 @@ pub fn op_setpagedevice(ctx: &mut Context) -> Result<(), PsError> {
             } else {
                 None
             };
+            ctx.o_stack.truncate(depth);
             if let Some(dev_entity) = dev_entity {
                 // Copy device resource dict, merge request entries on top
                 let new_pd = alloc_page_device(ctx);

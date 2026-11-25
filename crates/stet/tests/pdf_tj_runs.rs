@@ -177,10 +177,15 @@ fn a_type42_font_draws_its_charstrings_glyphs() {
         hex(&sfnt_with_cmap(&[(97, 2), (98, 1)]))
     );
     runs(&job);
-    let pdf = Interpreter::new().render_to_pdf(job.as_bytes(), 72.0).unwrap();
+    let pdf = Interpreter::new()
+        .render_to_pdf(job.as_bytes(), 72.0)
+        .unwrap();
     let text = String::from_utf8_lossy(&pdf);
     assert!(text.contains("/Flags 4"), "the font is symbolic");
-    assert!(!text.contains("/Differences"), "no Encoding sends a viewer to glyph names");
+    assert!(
+        !text.contains("/Differences"),
+        "no Encoding sends a viewer to glyph names"
+    );
 }
 
 /// A Type 42 font downloaded glyph by glyph, as Windows printer drivers do:
@@ -213,7 +218,9 @@ fn a_type42_font_downloaded_glyph_by_glyph_keeps_every_glyph() {
         hex(&bar)
     );
     runs(&job);
-    let pdf = Interpreter::new().render_to_pdf(job.as_bytes(), 72.0).unwrap();
+    let pdf = Interpreter::new()
+        .render_to_pdf(job.as_bytes(), 72.0)
+        .unwrap();
     let doc = stet_pdf_reader::PdfDocument::from_bytes(&pdf).unwrap();
     let page = doc.render_page(0, 72.0).unwrap();
     let fills = boxes(page.elements().iter());

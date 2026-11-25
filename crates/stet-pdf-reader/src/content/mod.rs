@@ -7,7 +7,6 @@
 //! Converts PDF page content into a `DisplayList` for rendering through
 //! the existing SkiaDevice pipeline.
 
-pub mod cid_unicode;
 pub mod cmap;
 pub mod color_space;
 pub mod font;
@@ -2971,7 +2970,7 @@ impl<'a> ContentInterpreter<'a> {
             });
         } else if let Some(pattern) = self.gstate.fill_pattern.clone() {
             self.display_list.push(DisplayElement::PatternFill {
-                params: PatternFillParams {
+                params: Box::new(PatternFillParams {
                     path,
                     fill_rule,
                     tile: pattern.tile,
@@ -2995,7 +2994,7 @@ impl<'a> ContentInterpreter<'a> {
                     } else {
                         0
                     },
-                },
+                }),
             });
         } else {
             self.display_list.push(DisplayElement::Fill {
@@ -3027,7 +3026,7 @@ impl<'a> ContentInterpreter<'a> {
             let mut sp = self.gstate.stroke_params_with_ctm();
             sp.ctm = ctm;
             self.display_list.push(DisplayElement::PatternFill {
-                params: PatternFillParams {
+                params: Box::new(PatternFillParams {
                     path: user_path,
                     fill_rule: FillRule::NonZeroWinding,
                     tile: pattern.tile,
@@ -3051,7 +3050,7 @@ impl<'a> ContentInterpreter<'a> {
                     } else {
                         0
                     },
-                },
+                }),
             });
             return;
         }
@@ -3075,7 +3074,7 @@ impl<'a> ContentInterpreter<'a> {
                 params: ClipParams {
                     fill_rule: FillRule::NonZeroWinding,
                     ctm: Matrix::identity(),
-                    stroke_params: Some(sp),
+                    stroke_params: Some(Box::new(sp)),
                 },
             });
             for elem in shading_box.0.elements() {
@@ -4803,7 +4802,7 @@ impl<'a> ContentInterpreter<'a> {
             });
         } else if let Some(pattern) = self.gstate.fill_pattern.clone() {
             self.display_list.push(DisplayElement::PatternFill {
-                params: PatternFillParams {
+                params: Box::new(PatternFillParams {
                     path,
                     fill_rule: FillRule::NonZeroWinding,
                     tile: pattern.tile,
@@ -4827,7 +4826,7 @@ impl<'a> ContentInterpreter<'a> {
                     } else {
                         0
                     },
-                },
+                }),
             });
         } else {
             let mut params = self.gstate.fill_params(FillRule::NonZeroWinding);
@@ -4857,7 +4856,7 @@ impl<'a> ContentInterpreter<'a> {
                 params: ClipParams {
                     fill_rule: FillRule::NonZeroWinding,
                     ctm: Matrix::identity(),
-                    stroke_params: Some(sp),
+                    stroke_params: Some(Box::new(sp)),
                 },
             });
             for elem in shading_box.0.elements() {
@@ -4883,7 +4882,7 @@ impl<'a> ContentInterpreter<'a> {
             let mut sp = self.gstate.stroke_params();
             sp.is_text_glyph = true;
             self.display_list.push(DisplayElement::PatternFill {
-                params: PatternFillParams {
+                params: Box::new(PatternFillParams {
                     path,
                     fill_rule: FillRule::NonZeroWinding,
                     tile: pattern.tile,
@@ -4907,7 +4906,7 @@ impl<'a> ContentInterpreter<'a> {
                     } else {
                         0
                     },
-                },
+                }),
             });
             return;
         }
@@ -8820,7 +8819,13 @@ impl<'a> ContentInterpreter<'a> {
             return Err(PdfError::Other("pattern recursion limit".into()));
         }
         let paint_type = pat_dict.get_int(b"PaintType").unwrap_or(1) as i32;
-        let tiling_type = pat_dict.get_int(b"TilingType").unwrap_or(1) as i32;
+        // ISO 32000-1 Table 75 allows 1, 2 and 3. Any other value is taken
+        // as 1, as makepattern's rangecheck keeps PostScript patterns in
+        // range, so the display list carries only values a consumer knows.
+        let tiling_type = match pat_dict.get_int(b"TilingType") {
+            Some(t @ 1..=3) => t as i32,
+            _ => 1,
+        };
 
         let bbox = deref_num_array(self.resolver, pat_dict, b"BBox")
             .map(|v| {

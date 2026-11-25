@@ -473,6 +473,10 @@ fn install_initial_tints(ctx: &mut Context) {
     let n = match &ctx.gstate.color_space {
         ColorSpace::Separation { .. } => 1,
         ColorSpace::DeviceN { num_colorants, .. } => *num_colorants as usize,
+        ColorSpace::Indexed { .. } => {
+            install_initial_index(ctx);
+            return;
+        }
         _ => return,
     };
     let depth = ctx.o_stack.len();
@@ -486,21 +490,38 @@ fn install_initial_tints(ctx: &mut Context) {
     ctx.gstate.color_components = Some(vec![1.0; n].into());
 }
 
+/// Paint the initial colour of an Indexed space: palette entry 0, as
+/// `setcolor` would set it (PLRM, `setcolorspace`). A lookup procedure or
+/// tint transform that fails leaves the colour black, for the reason
+/// [`install_initial_tints`] gives.
+fn install_initial_index(ctx: &mut Context) {
+    let depth = ctx.o_stack.len();
+    if ctx.o_stack.push(PsObject::int(0)).is_ok() && op_setcolor(ctx).is_ok() {
+        return;
+    }
+    ctx.o_stack.truncate(depth);
+    ctx.gstate.color = DeviceColor::black();
+    ctx.gstate.color_components = Some(Arc::from([0.0]));
+}
+
 /// Sample and cache the tint transform for Separation/DeviceN color spaces.
 /// Called after setcolorspace installs a new color space.
 fn cache_tint_table(ctx: &mut Context) {
     match &ctx.gstate.color_space {
         ColorSpace::Separation {
+            alt_space,
             tint_transform,
             num_alt_components,
             ..
         } => {
             let tt = *tint_transform;
             let nac = *num_alt_components;
+            let alt = alt_space.clone();
             ctx.gstate.cached_tint_table =
-                crate::image_ops::sample_tint_transform(ctx, tt, 1, nac).map(Arc::new);
+                crate::image_ops::sample_device_tint_transform(ctx, tt, 1, &alt, nac).map(Arc::new);
         }
         ColorSpace::DeviceN {
+            alt_space,
             num_colorants,
             tint_transform,
             num_alt_components,
@@ -509,8 +530,10 @@ fn cache_tint_table(ctx: &mut Context) {
             let tt = *tint_transform;
             let nc = *num_colorants;
             let nac = *num_alt_components;
+            let alt = alt_space.clone();
             ctx.gstate.cached_tint_table =
-                crate::image_ops::sample_tint_transform(ctx, tt, nc, nac).map(Arc::new);
+                crate::image_ops::sample_device_tint_transform(ctx, tt, nc, &alt, nac)
+                    .map(Arc::new);
         }
         _ => {
             ctx.gstate.cached_tint_table = None;
@@ -751,6 +774,7 @@ fn set_color_in_space(ctx: &mut Context) -> Result<(), PsError> {
         }
         ColorSpace::Separation {
             name,
+            alt_space,
             tint_transform,
             num_alt_components,
             ..
@@ -777,10 +801,11 @@ fn set_color_in_space(ctx: &mut Context) -> Result<(), PsError> {
             };
             ctx.o_stack.push(PsObject::real(tint_clamped))?;
             ctx.exec_sync(tint_transform)?;
-            set_color_from_tint_result(ctx, num_alt_components, colorants)
+            set_color_from_tint_result(ctx, num_alt_components, &alt_space, colorants)
         }
         ColorSpace::DeviceN {
             names,
+            alt_space,
             num_colorants,
             tint_transform,
             num_alt_components,
@@ -807,7 +832,7 @@ fn set_color_in_space(ctx: &mut Context) -> Result<(), PsError> {
                 ctx.o_stack.push(PsObject::real(t))?;
             }
             ctx.exec_sync(tint_transform)?;
-            set_color_from_tint_result(ctx, num_alt_components, colorants)
+            set_color_from_tint_result(ctx, num_alt_components, &alt_space, colorants)
         }
         // `comp1 … compn pattern setcolor` — same as `setpattern` except that
         // the color space is already Pattern and stays as it is.
@@ -831,35 +856,226 @@ struct ProcessColorants {
     native_fallback: Option<(f64, f64, f64, f64)>,
 }
 
+/// The device colour of `comps` in `color_space`, as `setcolor` gives
+/// one: clamped to 0-1 in a device space, through the CMYK profile for
+/// DeviceCMYK, through its profile for ICCBased, and by the CIE
+/// equations for a CIE-based space.
+///
+/// Shadings use it for their colours, and a Separation or DeviceN colour
+/// for its alternate space's components after the tint transform.
+pub(crate) fn components_to_device_color(
+    comps: &[f64],
+    color_space: &ColorSpace,
+    intent: IccRenderingIntent,
+    icc_cache: &mut stet_graphics::icc::IccCache,
+) -> DeviceColor {
+    match color_space {
+        ColorSpace::DeviceGray => {
+            DeviceColor::from_gray(comps.first().copied().unwrap_or(0.0).clamp(0.0, 1.0))
+        }
+        ColorSpace::DeviceRGB if comps.len() >= 3 => DeviceColor::from_rgb(
+            comps[0].clamp(0.0, 1.0),
+            comps[1].clamp(0.0, 1.0),
+            comps[2].clamp(0.0, 1.0),
+        ),
+        ColorSpace::DeviceCMYK if comps.len() >= 4 => DeviceColor::from_cmyk_icc_with_intent(
+            comps[0].clamp(0.0, 1.0),
+            comps[1].clamp(0.0, 1.0),
+            comps[2].clamp(0.0, 1.0),
+            comps[3].clamp(0.0, 1.0),
+            intent,
+            icc_cache,
+        ),
+        ColorSpace::CIEBasedABC { params, .. } if comps.len() >= 3 => {
+            DeviceColor::from_cie_abc(comps[0], comps[1], comps[2], params)
+        }
+        ColorSpace::CIEBasedA { params, .. } => {
+            DeviceColor::from_cie_a(comps.first().copied().unwrap_or(0.0), params)
+        }
+        ColorSpace::CIEBasedDEF { params, .. } if comps.len() >= 3 => {
+            DeviceColor::from_cie_def(comps[0], comps[1], comps[2], params)
+        }
+        ColorSpace::CIEBasedDEFG { params, .. } if comps.len() >= 4 => {
+            DeviceColor::from_cie_defg(comps[0], comps[1], comps[2], comps[3], params)
+        }
+        ColorSpace::ICCBased {
+            n, profile_hash, ..
+        } => {
+            if let Some(hash) = profile_hash
+                && let Some((r, g, b)) = icc_cache.convert_color_with_intent(hash, comps, intent)
+            {
+                return DeviceColor::from_rgb(r, g, b);
+            }
+            match n {
+                1 => DeviceColor::from_gray(comps.first().copied().unwrap_or(0.0).clamp(0.0, 1.0)),
+                3 if comps.len() >= 3 => DeviceColor::from_rgb(
+                    comps[0].clamp(0.0, 1.0),
+                    comps[1].clamp(0.0, 1.0),
+                    comps[2].clamp(0.0, 1.0),
+                ),
+                4 if comps.len() >= 4 => DeviceColor::from_cmyk_icc_with_intent(
+                    comps[0].clamp(0.0, 1.0),
+                    comps[1].clamp(0.0, 1.0),
+                    comps[2].clamp(0.0, 1.0),
+                    comps[3].clamp(0.0, 1.0),
+                    intent,
+                    icc_cache,
+                ),
+                _ => DeviceColor::from_gray(0.0),
+            }
+        }
+        _ => {
+            // Fallback: heuristic based on count
+            if comps.len() >= 4 {
+                DeviceColor::from_cmyk_icc_with_intent(
+                    comps[0].clamp(0.0, 1.0),
+                    comps[1].clamp(0.0, 1.0),
+                    comps[2].clamp(0.0, 1.0),
+                    comps[3].clamp(0.0, 1.0),
+                    intent,
+                    icc_cache,
+                )
+            } else if comps.len() >= 3 {
+                DeviceColor::from_rgb(
+                    comps[0].clamp(0.0, 1.0),
+                    comps[1].clamp(0.0, 1.0),
+                    comps[2].clamp(0.0, 1.0),
+                )
+            } else {
+                DeviceColor::from_gray(comps.first().copied().unwrap_or(0.0).clamp(0.0, 1.0))
+            }
+        }
+    }
+}
+
+/// The alternate space's components of `comps` in a Separation or DeviceN
+/// space, by running its tint transform; `comps` themselves in any other.
+pub(crate) fn convert_tint_color(
+    ctx: &mut Context,
+    comps: &[f64],
+    color_space: &ColorSpace,
+) -> Result<Vec<f64>, PsError> {
+    let (tint_transform, num_alt) = match color_space {
+        ColorSpace::Separation {
+            tint_transform,
+            num_alt_components,
+            ..
+        }
+        | ColorSpace::DeviceN {
+            tint_transform,
+            num_alt_components,
+            ..
+        } => (*tint_transform, *num_alt_components as usize),
+        _ => return Ok(comps.to_vec()),
+    };
+    for c in comps {
+        ctx.o_stack.push(PsObject::real(*c))?;
+    }
+    ctx.exec_sync(tint_transform)?;
+    let mut result = vec![0.0; num_alt];
+    for i in (0..num_alt).rev() {
+        result[i] = ctx.o_stack.pop()?.as_f64().unwrap_or(0.0);
+    }
+    Ok(result)
+}
+
+/// The base space's components of palette entry `index` of an Indexed
+/// space (PLRM 3e §4.8.4): the procedure's results when the lookup is a
+/// procedure, or the entry's bytes divided by 255 when it is a string.
+/// `index` is rounded and clipped to 0 to `hival`, as `setcolor` takes it.
+///
+/// A procedure gives components in the base space's own ranges, such as
+/// L* 0 to 100 for a Lab base, which a byte table cannot hold; the PLRM
+/// gives that as the reason to use one.
+fn indexed_entry(
+    ctx: &mut Context,
+    base: &ColorSpace,
+    hival: u32,
+    lookup: &[u8],
+    lookup_proc: Option<PsObject>,
+    index: f64,
+) -> Result<Vec<f64>, PsError> {
+    let index = index.round().clamp(0.0, hival as f64) as usize;
+    let m = color_space_components(base);
+    if let Some(proc_obj) = lookup_proc {
+        ctx.o_stack.push(PsObject::int(index as i64))?;
+        ctx.exec_sync(proc_obj)?;
+        if ctx.o_stack.len() < m {
+            return Err(PsError::StackUnderflow);
+        }
+        let mut comps = vec![0.0; m];
+        for c in comps.iter_mut().rev() {
+            *c = ctx.o_stack.pop()?.as_f64().ok_or(PsError::TypeCheck)?;
+        }
+        return Ok(comps);
+    }
+    let start = index * m;
+    let bytes = lookup.get(start..start + m).ok_or(PsError::RangeCheck)?;
+    Ok(bytes.iter().map(|&b| b as f64 / 255.0).collect())
+}
+
+/// The device colour of `comps` in `color_space`, through every space the
+/// colour passes on the way: an Indexed colour's palette entry in the base
+/// space, a Separation or DeviceN colour's tint transform into the
+/// alternate space, and then [`components_to_device_color`]. Also returns
+/// the components that last step took, which are in the space a shading's
+/// colour space is captured as.
+///
+/// An Indexed space over anything but a device space came out black, and
+/// one over a Separation or DeviceN space never ran its tint transform.
+pub(crate) fn resolve_components_color(
+    ctx: &mut Context,
+    comps: &[f64],
+    color_space: &ColorSpace,
+) -> Result<(DeviceColor, Vec<f64>), PsError> {
+    match color_space {
+        ColorSpace::Indexed {
+            base,
+            hival,
+            lookup,
+            lookup_proc,
+        } => {
+            let index = comps.first().copied().unwrap_or(0.0);
+            let entry = indexed_entry(ctx, base, *hival, lookup, *lookup_proc, index)?;
+            resolve_components_color(ctx, &entry, base)
+        }
+        ColorSpace::Separation { alt_space, .. } | ColorSpace::DeviceN { alt_space, .. } => {
+            let alt = convert_tint_color(ctx, comps, color_space)?;
+            resolve_components_color(ctx, &alt, alt_space)
+        }
+        _ => {
+            let intent = gstate_intent(ctx);
+            let color = components_to_device_color(comps, color_space, intent, &mut ctx.icc_cache);
+            Ok((color, comps.to_vec()))
+        }
+    }
+}
+
 /// Pop tint transform results from the stack and set the device color.
+///
+/// The components are the alternate space's, and are converted as that
+/// space converts them. Taking them by their number alone, as one gray,
+/// three RGB or four CMYK values clamped to 0-1, turned a CIE-based
+/// alternate's L* a* b* into RGB: a green spot colour whose alternate is
+/// Lab came out magenta.
 fn set_color_from_tint_result(
     ctx: &mut Context,
     n: u32,
+    alt_space: &ColorSpace,
     colorants: ProcessColorants,
 ) -> Result<(), PsError> {
     let n = n as usize;
     let mut components = vec![0.0f64; n];
     for i in (0..n).rev() {
         if !ctx.o_stack.is_empty() {
-            components[i] = ctx.o_stack.peek(0)?.as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
+            components[i] = ctx.o_stack.peek(0)?.as_f64().unwrap_or(0.0);
             ctx.o_stack.pop()?;
         }
     }
 
     let intent = gstate_intent(ctx);
-    ctx.gstate.color = match n {
-        1 => DeviceColor::from_gray(components[0]),
-        3 => DeviceColor::from_rgb(components[0], components[1], components[2]),
-        4 => DeviceColor::from_cmyk_icc_with_intent(
-            components[0],
-            components[1],
-            components[2],
-            components[3],
-            intent,
-            &mut ctx.icc_cache,
-        ),
-        _ => DeviceColor::from_gray(0.0),
-    };
+    ctx.gstate.color =
+        components_to_device_color(&components, alt_space, intent, &mut ctx.icc_cache);
     if ctx.gstate.color.native_cmyk.is_none() {
         ctx.gstate.color.native_cmyk = colorants.native_fallback;
     }
@@ -970,7 +1186,7 @@ fn set_icc_color(
 /// An ICCBased space's `/Range`: a `[min max]` pair for each of its `n`
 /// components, `[0 1]` for each when the dictionary gives none or gives one
 /// of the wrong length.
-fn icc_range(ctx: &Context, dict_entity: EntityId, n: u32) -> Vec<f64> {
+pub(crate) fn icc_range(ctx: &Context, dict_entity: EntityId, n: u32) -> Vec<f64> {
     let default: Vec<f64> = (0..n).flat_map(|_| [0.0, 1.0]).collect();
     let range = get_cie_float_array(ctx, dict_entity, b"Range", &default);
     if range.len() == default.len() {
@@ -1009,70 +1225,28 @@ fn icc_device_color(ctx: &mut Context, n: u32, hash: &[u8; 32], comps: &[f64]) -
 
 /// Set color in an Indexed color space: index → —
 ///
-/// Looks up the index in the palette and sets the resolved base-space color.
+/// Sets the colour the index's palette entry gives in the base space
+/// ([`resolve_components_color`]). A lookup procedure runs above the
+/// index, which is popped only once it has succeeded.
 fn set_indexed_color(ctx: &mut Context) -> Result<(), PsError> {
     if ctx.o_stack.is_empty() {
         return Err(PsError::StackUnderflow);
     }
-    let idx_obj = ctx.o_stack.peek(0)?;
-    let idx = match idx_obj.value {
+    let idx = match ctx.o_stack.peek(0)?.value {
         PsValue::Int(v) => v as f64,
         PsValue::Real(v) => v,
         _ => return Err(PsError::TypeCheck),
     };
-
-    // Clone the colorspace data we need before mutating ctx
-    let (base, hival, lookup) = match &ctx.gstate.color_space {
-        ColorSpace::Indexed {
-            base,
-            hival,
-            lookup,
-            ..
-        } => (base.clone(), *hival, lookup.clone()),
-        _ => return Err(PsError::TypeCheck),
+    let space = ctx.gstate.color_space.clone();
+    let ColorSpace::Indexed { hival, .. } = space else {
+        return Err(PsError::TypeCheck);
     };
-
-    // Round and clamp index
-    let index = (idx.round() as i32).clamp(0, hival as i32) as usize;
-
-    // Look up color in palette based on base color space
-    let components_per_color = match base.as_ref() {
-        ColorSpace::DeviceGray => 1,
-        ColorSpace::DeviceRGB => 3,
-        ColorSpace::DeviceCMYK => 4,
-        _ => 1,
-    };
-
-    let offset = index * components_per_color;
-    if offset + components_per_color > lookup.len() {
-        return Err(PsError::RangeCheck);
-    }
-
-    let color = match base.as_ref() {
-        ColorSpace::DeviceGray => {
-            let g = lookup[offset] as f64 / 255.0;
-            DeviceColor::from_gray(g)
-        }
-        ColorSpace::DeviceRGB => {
-            let r = lookup[offset] as f64 / 255.0;
-            let g = lookup[offset + 1] as f64 / 255.0;
-            let b = lookup[offset + 2] as f64 / 255.0;
-            DeviceColor::from_rgb(r, g, b)
-        }
-        ColorSpace::DeviceCMYK => {
-            let c = lookup[offset] as f64 / 255.0;
-            let m = lookup[offset + 1] as f64 / 255.0;
-            let y = lookup[offset + 2] as f64 / 255.0;
-            let k = lookup[offset + 3] as f64 / 255.0;
-            let intent = gstate_intent(ctx);
-            DeviceColor::from_cmyk_icc_with_intent(c, m, y, k, intent, &mut ctx.icc_cache)
-        }
-        _ => DeviceColor::from_gray(0.0),
-    };
+    let (color, _) = resolve_components_color(ctx, &[idx], &space)?;
+    let index = idx.round().clamp(0.0, hival as f64);
 
     ctx.o_stack.pop()?;
     ctx.gstate.color = color;
-    ctx.gstate.color_components = Some(Arc::from([index as f64]));
+    ctx.gstate.color_components = Some(Arc::from([index]));
     clear_pattern_color(ctx);
     Ok(())
 }
@@ -1128,36 +1302,10 @@ fn default_color_for_space(cs: &ColorSpace, ctx: &mut Context) -> DeviceColor {
             ctx.gstate.icc_components = Some(comps.to_vec());
             color
         }
-        ColorSpace::Indexed { base, lookup, .. } => {
-            // Default is index 0 resolved through the palette
-            let components_per_color = match base.as_ref() {
-                ColorSpace::DeviceGray => 1,
-                ColorSpace::DeviceRGB => 3,
-                ColorSpace::DeviceCMYK => 4,
-                _ => 1,
-            };
-            if lookup.len() >= components_per_color {
-                match base.as_ref() {
-                    ColorSpace::DeviceGray => DeviceColor::from_gray(lookup[0] as f64 / 255.0),
-                    ColorSpace::DeviceRGB => DeviceColor::from_rgb(
-                        lookup[0] as f64 / 255.0,
-                        lookup[1] as f64 / 255.0,
-                        lookup[2] as f64 / 255.0,
-                    ),
-                    ColorSpace::DeviceCMYK => DeviceColor::from_cmyk_icc_with_intent(
-                        lookup[0] as f64 / 255.0,
-                        lookup[1] as f64 / 255.0,
-                        lookup[2] as f64 / 255.0,
-                        lookup[3] as f64 / 255.0,
-                        intent,
-                        &mut ctx.icc_cache,
-                    ),
-                    _ => DeviceColor::from_gray(0.0),
-                }
-            } else {
-                DeviceColor::from_gray(0.0)
-            }
-        }
+        // Indexed: the initial colour is palette entry 0, which
+        // `install_initial_tints` sets once the space is current, since a
+        // lookup procedure or a Separation or DeviceN base runs PostScript.
+        ColorSpace::Indexed { .. } => DeviceColor::black(),
         // Separation/DeviceN: the initial colour is the tint transform's
         // result at tint 1.0, which `install_initial_tints` sets once the
         // space is current. Black stands in until then, and if it fails.
@@ -1389,10 +1537,11 @@ fn parse_indexed_colorspace(
         _ => return Err(PsError::TypeCheck),
     };
 
-    // Element 2: hival (max index, 0–255)
+    // Element 2: hival, the largest index: up to 4095, enough for a
+    // 12-bit image (PLRM 3e §4.8.4).
     let hival_obj = ctx.arrays.get_element(entity, start + 2);
     let hival_i = hival_obj.as_i32().ok_or(PsError::TypeCheck)?;
-    if !(0..=255).contains(&hival_i) {
+    if !(0..=4095).contains(&hival_i) {
         return Err(PsError::RangeCheck);
     }
     let hival = hival_i as u32;
@@ -1602,18 +1751,8 @@ fn parse_cie_def_colorspace(
     if range_def_vec.len() >= 6 {
         range_def.copy_from_slice(&range_def_vec[..6]);
     }
-    let params = CieDefParams {
-        range_def,
-        range_hij: [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-        decode_def: None,
-        m1: 0,
-        m2: 0,
-        m3: 0,
-        a_table: Vec::new(),
-        b_table: Vec::new(),
-        c_table: Vec::new(),
-        abc_params: CieAbcParams::default(),
-    };
+    let mut params = CieDefParams::default();
+    params.range_def = range_def;
     Ok(ColorSpace::CIEBasedDEF {
         params: Arc::new(params),
         dict_entity,
@@ -1648,19 +1787,8 @@ fn parse_cie_defg_colorspace(
     if range_defg_vec.len() >= 8 {
         range_defg.copy_from_slice(&range_defg_vec[..8]);
     }
-    let params = CieDefgParams {
-        range_defg,
-        range_hijk: [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-        decode_defg: None,
-        m1: 0,
-        m2: 0,
-        m3: 0,
-        m4: 0,
-        a_table: Vec::new(),
-        b_table: Vec::new(),
-        c_table: Vec::new(),
-        abc_params: CieAbcParams::default(),
-    };
+    let mut params = CieDefgParams::default();
+    params.range_defg = range_defg;
     Ok(ColorSpace::CIEBasedDEFG {
         params: Arc::new(params),
         dict_entity,
@@ -2059,12 +2187,12 @@ pub fn color_space_components(cs: &ColorSpace) -> usize {
     }
 }
 
-/// Pre-evaluate CIE decode procedures and DEF/DEFG lookup tables.
-///
-/// For CIEBasedABC/A: evaluates DecodeABC, DecodeLMN, DecodeA procedures at 256
-/// If the Indexed color space has a procedure-based lookup, pre-evaluate it
-/// by calling the procedure for each index 0..hival, collecting the color
-/// component bytes into a lookup Vec<u8>.
+/// Sample an Indexed space's lookup procedure into its byte table, for a
+/// consumer that reads the palette as bytes in a device base space: each
+/// entry's components clipped to 0-1 and scaled to 255. The procedure is
+/// kept, and the colour code calls it ([`indexed_entry`]), since its
+/// values are in the base space's ranges, which the bytes cannot hold for
+/// a CIE-based base.
 fn resolve_indexed_proc_lookup(ctx: &mut Context, cs: ColorSpace) -> Result<ColorSpace, PsError> {
     if let ColorSpace::Indexed {
         ref base,
@@ -2074,12 +2202,7 @@ fn resolve_indexed_proc_lookup(ctx: &mut Context, cs: ColorSpace) -> Result<Colo
     } = cs
         && let Some(proc_obj) = *lookup_proc
     {
-        let ncomp = match base.as_ref() {
-            ColorSpace::DeviceGray => 1,
-            ColorSpace::DeviceRGB => 3,
-            ColorSpace::DeviceCMYK => 4,
-            _ => 3,
-        };
+        let ncomp = color_space_components(base);
         let base = base.clone();
         let mut lookup = Vec::with_capacity((hival as usize + 1) * ncomp);
         for idx in 0..=hival {
@@ -2101,12 +2224,15 @@ fn resolve_indexed_proc_lookup(ctx: &mut Context, cs: ColorSpace) -> Result<Colo
             base,
             hival,
             lookup,
-            lookup_proc: None,
+            lookup_proc: Some(proc_obj),
         });
     }
     Ok(cs)
 }
 
+/// Pre-evaluate CIE decode procedures and DEF/DEFG lookup tables.
+///
+/// For CIEBasedABC/A: evaluates DecodeABC, DecodeLMN, DecodeA procedures at 256
 /// sample points via exec_sync, storing the results as lookup tables.
 /// For CIEBasedDEF/DEFG: pre-converts the entire 3D/4D table through the CIE
 /// pipeline to sRGB for fast interpolation at render time.
@@ -2721,18 +2847,16 @@ fn precompute_cie_def_table(
     let (dims, [a_table, b_table, c_table]) =
         read_cie_table(ctx, dict_entity, 3, &abc_params.range_abc)?;
     let decode_def = sample_decode_procs::<3>(ctx, dict_entity, b"DecodeDEF", &range_def)?;
-    Ok(CieDefParams {
-        range_def,
-        range_hij,
-        decode_def,
-        m1: dims[0],
-        m2: dims[1],
-        m3: dims[2],
-        a_table,
-        b_table,
-        c_table,
-        abc_params,
-    })
+    let mut params = CieDefParams::default();
+    params.range_def = range_def;
+    params.range_hij = range_hij;
+    params.decode_def = decode_def;
+    [params.m1, params.m2, params.m3] = [dims[0], dims[1], dims[2]];
+    params.a_table = a_table;
+    params.b_table = b_table;
+    params.c_table = c_table;
+    params.abc_params = abc_params;
+    Ok(params)
 }
 
 /// Read a CIEBasedDEFG space's table and decode stages: DEFG → DecodeDEFG →
@@ -2747,19 +2871,16 @@ fn precompute_cie_defg_table(
     let (dims, [a_table, b_table, c_table]) =
         read_cie_table(ctx, dict_entity, 4, &abc_params.range_abc)?;
     let decode_defg = sample_decode_procs::<4>(ctx, dict_entity, b"DecodeDEFG", &range_defg)?;
-    Ok(CieDefgParams {
-        range_defg,
-        range_hijk,
-        decode_defg,
-        m1: dims[0],
-        m2: dims[1],
-        m3: dims[2],
-        m4: dims[3],
-        a_table,
-        b_table,
-        c_table,
-        abc_params,
-    })
+    let mut params = CieDefgParams::default();
+    params.range_defg = range_defg;
+    params.range_hijk = range_hijk;
+    params.decode_defg = decode_defg;
+    [params.m1, params.m2, params.m3, params.m4] = [dims[0], dims[1], dims[2], dims[3]];
+    params.a_table = a_table;
+    params.b_table = b_table;
+    params.c_table = c_table;
+    params.abc_params = abc_params;
+    Ok(params)
 }
 
 /// Get a dict entry as a PsObject.

@@ -3717,10 +3717,31 @@ fn register_shading_icc_profiles(list: &DisplayList, cache: &mut IccCache) {
     let mut seen = HashSet::new();
     scan(list.elements(), &mut seen, cache);
 }
+
+/// An image's samples as premultiplied RGBA, `width` x `height` x 4 bytes,
+/// as the renderer paints them: colour converted through `icc` (the device
+/// formulas without one), then the pixels the colour key (`/MaskColor`)
+/// names cleared. For a consumer that takes images out of a display list.
+///
+/// No transfer function is applied, and overprint is not simulated: a CMYK
+/// sample that paints nothing under OPM 1 still comes out opaque. An image
+/// kept as JPEG data ([`ImageParams::jpeg`]) is decoded; one that doesn't
+/// decode to its size gives no pixels.
+pub fn image_samples_to_rgba(
+    sample_data: &[u8],
+    params: &ImageParams,
+    icc: Option<&IccCache>,
+) -> Vec<u8> {
+    match params.samples(sample_data) {
+        Some(samples) => image_to_rgba(&samples, params, icc, false, None),
+        None => Vec::new(),
+    }
+}
+
 /// An image's samples as premultiplied RGBA: [`samples_to_rgba`], then the
 /// transfer function the paint applies (see [`paint_transfer`]) on each
 /// pixel's colour, then the colour key's pixels cleared.
-pub fn image_to_rgba(
+fn image_to_rgba(
     sample_data: &[u8],
     params: &ImageParams,
     icc: Option<&IccCache>,
@@ -5419,10 +5440,25 @@ fn render_element(
             if iw == 0 || ih == 0 {
                 return;
             }
-
             let needs_overprint = params.overprint
                 && band_state.cmyk_buffer.is_some()
                 && image_supports_overprint(&params.color_space);
+
+            // An image kept as JPEG data has no samples until it is decoded,
+            // which only the branches below that read them need: not a cached
+            // image with no CMYK buffer to update, drawn once per band.
+            let needs_samples = needs_overprint
+                || band_state.cmyk_buffer.is_some()
+                || cached_image(ctx.preprocessed, ctx.elem_idx).is_none();
+            let samples = if needs_samples {
+                let Some(samples) = params.samples(sample_data) else {
+                    return;
+                };
+                samples
+            } else {
+                std::borrow::Cow::Borrowed(&sample_data[..])
+            };
+            let sample_data: &[u8] = &samples;
 
             if needs_overprint {
                 let mut cmyk_buf = band_state.cmyk_buffer.take().unwrap();
@@ -8952,9 +8988,12 @@ fn paint_pattern_fill(
             {
                 let iw = ip.width;
                 let ih = ip.height;
-                if iw > 0 && ih > 0 {
+                if iw > 0
+                    && ih > 0
+                    && let Some(samples) = ip.samples(sample_data)
+                {
                     let rgba = image_to_rgba(
-                        sample_data,
+                        &samples,
                         ip,
                         ctx.icc,
                         ctx.opm_zero_transparent,
@@ -9709,6 +9748,10 @@ impl OutputDevice for SkiaDevice {
         if w == 0 || h == 0 {
             return;
         }
+        let Some(samples) = params.samples(sample_data) else {
+            return;
+        };
+        let sample_data: &[u8] = &samples;
         let rgba_data = image_to_rgba(
             sample_data,
             params,
@@ -13539,7 +13582,9 @@ fn build_cache_entry<T: Send>(
         DisplayElement::Image {
             sample_data,
             params,
-        } => image(sample_data, params, transfer_suppressed)
+        } => params
+            .samples(sample_data)
+            .and_then(|samples| image(&samples, params, transfer_suppressed))
             .map_or(CacheEntry::Empty, CacheEntry::Image),
         DisplayElement::OcgGroup {
             elements,
@@ -15422,29 +15467,30 @@ pub fn render_region(
     image_cache: Option<&ImageCache>,
     no_aa: bool,
 ) -> Vec<u8> {
-    render_region_inner(list, vp_x, vp_y, vp_w, vp_h, pixel_w, pixel_h, dpi, icc, image_cache, no_aa, true)
+    render_region_with_background(
+        list,
+        vp_x,
+        vp_y,
+        vp_w,
+        vp_h,
+        pixel_w,
+        pixel_h,
+        dpi,
+        icc,
+        image_cache,
+        no_aa,
+        PageBackground::White,
+    )
 }
 
-/// Like [`render_region`], but leaves the unpainted area transparent: premultiplied RGBA, for a
-/// consumer that places the region over other content (a vector writer's raster island).
-#[allow(clippy::too_many_arguments)]
-pub fn render_region_transparent(
-    list: &DisplayList,
-    vp_x: f64,
-    vp_y: f64,
-    vp_w: f64,
-    vp_h: f64,
-    pixel_w: u32,
-    pixel_h: u32,
-    dpi: f64,
-    icc: Option<&IccCache>,
-    no_aa: bool,
-) -> Vec<u8> {
-    render_region_inner(list, vp_x, vp_y, vp_w, vp_h, pixel_w, pixel_h, dpi, icc, None, no_aa, false)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_region_inner(
+/// [`render_region`] with the page background chosen, as
+/// [`render_to_rgba_with_background`] chooses it for a whole page:
+/// [`PageBackground::White`] composites onto white paper (what
+/// `render_region` does), [`PageBackground::Transparent`] leaves the
+/// unpainted area clear and returns straight-alpha RGBA, for a consumer that
+/// places the region over other content.
+#[expect(clippy::too_many_arguments)]
+pub fn render_region_with_background(
     list: &DisplayList,
     vp_x: f64,
     vp_y: f64,
@@ -15456,10 +15502,16 @@ fn render_region_inner(
     icc: Option<&IccCache>,
     image_cache: Option<&ImageCache>,
     no_aa: bool,
-    onto_white: bool,
+    page_background: PageBackground,
 ) -> Vec<u8> {
     if pixel_w == 0 || pixel_h == 0 || vp_w <= 0.0 || vp_h <= 0.0 {
-        return vec![0xFF; pixel_w as usize * pixel_h as usize * 4];
+        // Nothing to paint: white paper is opaque, a transparent page clear.
+        let fill = if page_background.is_transparent() {
+            0x00
+        } else {
+            0xFF
+        };
+        return vec![fill; pixel_w as usize * pixel_h as usize * 4];
     }
 
     let layer_set = LayerSet::new();
@@ -15579,13 +15631,12 @@ fn render_region_inner(
         }
     }
 
-    if onto_white {
-        composite_onto_white(pixmap.data_mut());
-    }
     // Extract only the requested pixel_h rows (skip OVERLAP padding).
     let row_bytes = pixel_w as usize * 4;
     let end = pixel_h as usize * row_bytes;
-    pixmap.data()[..end].to_vec()
+    let mut rgba = pixmap.data()[..end].to_vec();
+    finish_page_pixels(&mut rgba, page_background);
+    rgba
 }
 /// Copy a rectangular region from parent pixmap into a smaller crop pixmap.
 fn copy_backdrop_crop(
@@ -23273,7 +23324,7 @@ mod clip_coverage_tests {
             y0: 0.0,
             x1: 3.0,
             y1: 0.0,
-            color_stops: black_stops(),
+            color_stops: black_stops().into(),
             extend_start: true,
             extend_end: true,
             ctm: Matrix::default(),
@@ -23315,7 +23366,7 @@ mod clip_coverage_tests {
             x1: 1.5,
             y1: 1.5,
             r1: 10.0,
-            color_stops: black_stops(),
+            color_stops: black_stops().into(),
             extend_start: true,
             extend_end: true,
             ctm: Matrix::default(),

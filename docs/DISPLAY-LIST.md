@@ -9,6 +9,15 @@ output. Elements are in painter's order (back to front). All coordinates
 are in **device space** — paths have already been transformed through the
 CTM at the DPI specified during interpretation.
 
+Every element in the `Vec` takes the size of the largest variant, so the
+large and uncommon payloads are boxed: `Text` and `PatternFill` hold a
+`Box` of their params, and a clip's stroke parameters are an
+`Option<Box<StrokeParams>>`. That keeps an element at 496 bytes, sized by
+`Stroke`, rather than 752; a page of a million fills is about 250 MB
+smaller for it. Build one with `Box::new(params)`; reading needs no change:
+field access goes through the box, and a `&Box<T>` coerces to `&T` where
+one is expected.
+
 ## Element Types
 
 ### Fill
@@ -88,6 +97,26 @@ share the sample buffer without copying.
 | `alpha_is_shape` | `bool` | Alpha-is-shape (PDF `AIS`) |
 | `rendering_intent` | `u8` | Intent for converting the image's colours (see "Rendering intent") |
 | `transfer` | `TransferState` | Transfer function in force, applied after conversion to RGB (see "Print Production State") |
+| `jpeg` | `Option<Arc<Vec<u8>>>` | The image as JPEG data, with `sample_data` empty (see "Kept JPEG data"); `None` otherwise |
+
+#### Kept JPEG data
+
+With `InterpreterBuilder::keep_jpeg_data()`, the PostScript interpreter
+puts a JPEG image into the list as its JPEG bytes in `params.jpeg`, with
+an empty `sample_data`, instead of decoding it. That is for a consumer
+that writes images out as they are, such as an SVG or PDF writer, so that
+a page of photographs never holds them decoded. It only does this where
+any JPEG reader shows the bytes as stet decodes them: an 8-bit
+`DeviceGray` or `DeviceRGB` image with the default `Decode`, a JPEG of the
+image's size and component count stored as YCbCr (for three components),
+with no Exif rotation and no ICC profile. Any other JPEG is decoded as
+usual. The PDF reader never keeps JPEG data.
+
+A renderer that reads `sample_data` directly must decode such an image
+first. `params.samples(&sample_data)` gives the samples, decoding the JPEG
+when there is one, and `None` when it doesn't decode to the image's size.
+`DisplayList::decode_kept_jpeg()` does the same for a whole list, nested
+lists included. stet's own renderer and PDF writer call `samples()`.
 
 #### Sample depth
 
@@ -131,7 +160,7 @@ program or PDF:
 ### Text
 
 ```rust
-Text { params: TextParams }
+Text { params: Box<TextParams> }
 ```
 
 A text run from a PostScript show operator. Used by the PDF output device
@@ -332,7 +361,8 @@ InitClip
 the clip to the full page. These are control elements — they have no
 visual output but affect all subsequent paint elements.
 
-When `ClipParams.stroke_params` is `Some`, the clip path is a stroke
+When `ClipParams.stroke_params` (an `Option<Box<StrokeParams>>`) is
+`Some`, the clip path is a stroke
 centerline rather than a fill path. The renderer expands it to a stroke
 outline before rasterizing the clip mask. Used for shading pattern strokes.
 
@@ -366,8 +396,12 @@ PatchShading { params: PatchShadingParams }     // Types 6/7: Coons/tensor patch
 
 All shading types carry their native `ShadingColorSpace` (DeviceGray,
 DeviceRGB, DeviceCMYK, or ICCBased with embedded profile data). Gradient
-color stops are pre-sampled from PostScript functions. Mesh and patch data
-includes per-vertex colors and coordinates in device space.
+color stops are pre-sampled from PostScript functions. An axial or radial
+shading's `color_stops` is an `Arc<[ColorStop]>`: the PDF reader samples a
+shading object once per page and every use of it shares the stops, so a
+gradient drawn thousands of times holds one copy. Build one from a
+`Vec<ColorStop>` with `.into()`. Mesh and patch data includes per-vertex
+colors and coordinates in device space.
 
 A mesh or patch shading whose colours come from a single-input function
 (PDF `/Function`) carries `color_lut`, the function sampled at 256 inputs
@@ -393,7 +427,7 @@ pre-converted ones.
 ### PatternFill
 
 ```rust
-PatternFill { params: PatternFillParams }
+PatternFill { params: Box<PatternFillParams> }
 ```
 
 A path filled or stroked with a tiling pattern. Contains a pre-rendered
@@ -410,6 +444,7 @@ uncolored (PaintType 2) patterns.
 | `bbox` | `[f64; 4]` | Tile bbox in pattern space |
 | `xstep`, `ystep` | `f64` | Horizontal/vertical step between tile origins |
 | `paint_type` | `i32` | 1 = colored, 2 = uncolored |
+| `tiling_type` | `i32` | 1 = constant spacing (a device may round the step to whole pixels), 2 = no distortion (the exact step), 3 = faster tiling. Always 1, 2 or 3. The rasteriser ignores it; a vector writer reads it to know whether the step is exact |
 | `underlying_color` | `Option<DeviceColor>` | Fill color for uncolored patterns |
 | `pattern_id` | `u32` | Unique ID for PDF dedup |
 | `device_space_tile` | `bool` | `true` when tile element CTMs already bake in the pattern matrix |

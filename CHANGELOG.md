@@ -31,13 +31,295 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marks stay on the display list, so every other device draws them as
   before.
 
-### Changed
+### Fixed
 
+- **The prebuilt binaries no longer carry two dependency versions
+  crates.io has yanked.** The viewer was built with `async-executor`
+  1.14.0, whose 1.14.1 fixes a use-after-free when a waker fires as an
+  executor is dropped (reached through the viewer's Linux accessibility
+  support), and with `clipboard-win` 5.4.1 (the Windows clipboard). They
+  had been pinned in `Cargo.lock` since 0.8.0 and are now 1.14.1 and
+  5.4.3. The musl binary has no viewer and was unaffected, and crates
+  built from crates.io resolve their own versions.
+
+## [0.11.0] — 2026-11-18
+
+### Breaking
+
+- **`stet_core::context::GroupKind::Transparency` has a new field,
+  `composite_at_begin`**: set for a group opened with Ghostscript's
+  `.begintransparencygroup`, whose opacity and blend mode are recorded
+  when it begins (see Added). Code that builds the variant or matches it
+  without `..` needs the field. Contributed by @nielsbosma (#32).
+- **`stet_graphics::device::ImageParams` has a new public field, `jpeg`**,
+  an image's JPEG data when the interpreter keeps it (see Added). Code
+  that builds `ImageParams` with a full struct literal needs the field
+  (`jpeg: None`), or `..Default::default()`. Contributed by
+  @nielsbosma (#42).
+- **`stet_core::file_store::FileStore::get_embedded_file` returns
+  `Option<EmbeddedFile>`**, not `Option<&'static [u8]>`, so that it can
+  hand back files a host program supplies at run time (see Added).
+  `EmbeddedFile` dereferences to `[u8]`: a caller that reads the bytes
+  passes `&data` where it passed `data`, and one that kept the `'static`
+  slice holds the `EmbeddedFile` instead. Contributed by
+  @nielsbosma (#34).
+
+### Added
+
+- **The largest page a PostScript or EPS file may declare can be
+  raised.** Pages are clamped to 14400 pt (200 inches) a side, which cut
+  off real large-format artwork: an Illustrator EPS of a 204-inch banner
+  lost its last 4 inches. `InterpreterBuilder::max_page_size(points)`,
+  `Context::max_page_size_points` and the CLI's `--max-page-size <PT>`
+  set the limit; `f64::INFINITY` (`inf` on the command line) removes it.
+  The default is unchanged. Contributed by @nielsbosma (#36).
+- **`InterpreterBuilder::default_page_size(width, height)` sets the page a
+  PostScript job starts on** when the program asks for none; the default
+  stays Letter. It is a default rather than an override, unlike the CLI's
+  `--page`: a program's own `setpagedevice` still changes the page, and an
+  EPS file still gets its bounding box. `render_to_display_list`, `render`
+  and `render_to_pdf` all use it. Contributed by @nielsbosma (#44).
+- **Ghostscript's transparency-group form, `dict llx lly urx ury
+  .begintransparencygroup`,** and its `.pushpdf14devicefilter` /
+  `.poppdf14devicefilter` brackets, which do nothing in stet. A group
+  opened with `.begintransparencygroup` is composited with the opacity
+  and blend mode current when it began, as in Ghostscript, so its
+  `examples/transparency_example.ps` now renders as `gs
+  -dALLOWPSTRANSPARENCY` does instead of stopping at
+  `.pushpdf14devicefilter`. `begintransparencygroup` is unchanged.
+  Contributed by @nielsbosma (#32).
+- **`InterpreterBuilder::keep_jpeg_data()` keeps JPEG images in display
+  lists as their JPEG data**, not their samples, for a consumer that
+  writes images out as they are, such as an SVG writer. A page of
+  photographs then never holds them decoded: an EPS of 3,320 photographs
+  that ran out of memory decoded (3.5 GB of samples) peaks at 522 MB. It
+  applies only where every JPEG reader shows the data as stet decodes it;
+  anything else is decoded as before. `render()`, `render_to_pdf()` and
+  `image_samples_to_rgba` decode kept images, and
+  `DisplayList::decode_kept_jpeg()` decodes a whole list. Off by default.
+  Contributed by @nielsbosma (#42).
+- **A program embedding stet can supply resource files stet does not
+  ship,** such as CJK CMaps and CIDFonts, with
+  `FileStore::set_embedded_provider`. `findresource`, `resourcestatus`
+  and `file` find them as they find stet's own resources, and under
+  `--safer` or a `FileAccess` policy a supplied file is treated as
+  built-in only when it is opened by its exact name. Contributed by
+  @nielsbosma (#34).
+- **CJK fonts a file names but the machine lacks can be drawn with a
+  substitute for their character collection,** as Ghostscript's
+  `cidfmap` does. `.CIDFontSubstitutes` maps a collection (`/Japan1`,
+  `/GB1`, `/CNS1`, `/Korea1`) to the CIDFont to use in place of one that
+  is missing; it is empty by default, so nothing changes until a program
+  registers a substitute. `findfont` of a `CIDFontName-CMapName` name
+  such as `Ryumin-Light-90ms-RKSJ-H` composes the font from the CIDFont,
+  or its substitute, and the CMap. `/Font` and `/CIDFont`
+  `resourcestatus` report such fonts as available to load (status 2),
+  which Ghostscript's CJK test files check before every glyph.
+  Contributed by @nielsbosma (#34).
+
+### Fixed
+
+- **Type 0 fonts with the escape, 1/7, 9/7, double-escape and shift
+  mappings (`FMapType` 3, 4, 5, 7 and 8) choose their fonts as the PLRM
+  says.** The font number now selects a font through the font's
+  `Encoding`, an escape or shift byte switches fonts for the rest of the
+  string, and those bytes are not drawn as characters. `show` and
+  `xyshow` match Ghostscript for every mapping. `cshow` gives its
+  procedure the decoded character code, one per character, rather than
+  one entry per byte. Contributed by @nielsbosma (#29).
+- **A page built without the `render` feature reports its own size.**
+  `render_to_display_list` in a `default-features = false` build gave
+  every page Letter's dimensions, whatever an EPS bounding box or a
+  program's `setpagedevice` had made it. Contributed by @nielsbosma (#44).
+- **A `pdfmark` called without a test for it no longer stops the job when
+  the output is not PDF.** Rendering to PNG, the viewer or WASM leaves
+  `pdfmark` undefined, so prologues that test `/pdfmark where` take their
+  printer branch. A file that calls it without a test, as files written
+  for Distiller or Ghostscript do, used to stop with `undefined`. The call
+  now pops its operands down to the mark and records nothing, as
+  Ghostscript does on a device that ignores pdfmarks. `where` and `known`
+  still report `pdfmark` as undefined. Contributed by @nielsbosma (#27).
+- **`[ pdfmark`, with no type tag, raises `stackunderflow`** as in
+  Ghostscript, not `typecheck`; this applies to PDF output too. Errors
+  from an unguarded call are reported as `pdfmark`. Contributed by
+  @nielsbosma (#27).
+- **CID-keyed text reads each code at the length the CMap's codespace
+  gives it** (Adobe TN 5014). Codes were read at the width of the first
+  codespace range, so in `90ms-RKSJ-H`, whose first range is one byte
+  wide, every two-byte Shift-JIS character came apart into two codes and
+  drew two `.notdef` glyphs. `show`, `cshow`, `xshow`, `xyshow`,
+  `widthshow` and text extraction all see the same codes. Contributed by
+  @nielsbosma (#33).
+- **A CMap keeps every block of mappings, and uses the CMap it names
+  with `usecmap`.** Each `endcidrange`, `endcidchar` or `endnotdef…`
+  block replaced the ones before it, so a CMap kept only its last block
+  of at most 100 entries, and a `usecmap` parent was never read. A code
+  now takes its CID from the nearest CMap in the chain that maps it, so
+  `UniJISPro-UTF8-V` gives its own vertical forms rather than its
+  parent's horizontal ones; `notdefchar` and `notdefrange` are used too.
+  Contributed by @nielsbosma (#33, #34).
+- **`glyphshow` with an integer shows that CID when the current font is
+  a CIDFont**, as the PLRM says, instead of raising `typecheck`.
+  Contributed by @nielsbosma (#33).
+- **`resourcestatus` gives status 2 for a resource that is not loaded
+  but whose file is there** (PLRM 3.9). Categories built on the Generic
+  implementation answered `false`. Contributed by @nielsbosma (#33).
+- **`filenameforall` gives back names spelled as the template spells
+  them.** On Windows, `(fonts/*.pfb)` listed `fonts\a.pfb`, a name the
+  program never wrote, and on every system `./` and doubled separators
+  were dropped. Each name now keeps the template's own text, with only
+  its wildcard components replaced, as in Ghostscript. Reported by
+  @nielsbosma.
+- **`filenameforall` and `resourceforall` templates follow the PLRM:**
+  `\` makes the next character literal (`(x\\*y)` matches only `x*y`),
+  and `[` is an ordinary character rather than the start of a character
+  class. On Windows `\` separates path components in a `filenameforall`
+  template, as `/` does.
+- **`filenameforall` raises `rangecheck` when a name does not fit the
+  scratch string**, as the PLRM and Ghostscript do, rather than passing a
+  truncated name that may be some other file's; and `invalidaccess` for a
+  template it cannot read or a scratch string it cannot write.
+
+## [0.10.0] — 2026-11-09
+
+### Breaking
+
+- **A tiling pattern's `TilingType` reaches the display list and the
+  PDF output.** `PatternFillParams` and `stet_pdf_reader`'s
+  `TilingPattern` have a new `tiling_type` field, set from a PostScript
+  pattern and from a PDF pattern's `/TilingType`: 1 lets a device round
+  the step to whole pixels, 2 asks for the exact step. PostScript converted to PDF wrote `/TilingType 1` for every
+  pattern and now keeps the pattern's own. Rendering is unchanged, since
+  the rasteriser does not read it; a vector writer can. A PDF value
+  outside 1 to 3 is read as 1. Code that builds either struct itself
+  needs to set the new field. Contributed by @nielsbosma (#38).
+- **`stet_core::file_store::FilterKind::SubFileDecode` has two new
+  public fields, `matched` and `found`**, the filter's progress through
+  its end-of-data marker (see Fixed). Code that builds the variant with a
+  struct literal needs them; `FilterKind::sub_file_decode` builds one
+  without naming them. Contributed by @nielsbosma (#26).
 - **`stet_core::file_store::FileHandle::StringSource`'s `data` is an
   `Arc<Vec<u8>>`**, so the scanner can hold a source's bytes while it
   allocates (see Fixed); `FileStore::shared_remaining` hands out that
   share. Code matching the variant reads the bytes through the `Arc`
   unchanged. Contributed by @nielsbosma (#20).
+- **`stet_graphics::color::CieDefParams` and `CieDefgParams` have new
+  public fields:** `range_hij` and `decode_def`, and `range_hijk` and
+  `decode_defg` — the `/RangeHIJ(K)` and `/DecodeDEF(G)` stages of their
+  colour spaces (see Fixed). Code that builds either with a struct literal
+  needs the fields. Both are now `#[non_exhaustive]`, as this entry
+  promised when the fields were added, so a later field is not a breaking
+  change: build one from `Default` (identity ranges and decoding, no table)
+  and set its fields.
+- **An axial or radial shading's colour stops are shared, so a page that
+  draws the same gradient many times holds it once.**
+  `AxialShadingParams::color_stops` and `RadialShadingParams::color_stops`
+  are `Arc<[ColorStop]>` rather than `Vec<ColorStop>`, and the PDF reader
+  hands every use of a shading the stops it sampled the first time, where
+  it copied them for each. Page 16 of a Keynote export drawing 4,524
+  gradients peaks at 224 MB rather than 1,068 MB and renders in 0.6 s
+  rather than 1.0 s, unchanged in output. Code that builds either struct
+  makes the field from a `Vec<ColorStop>` with `.into()`; code reading it
+  is unchanged.
+- **A display-list element takes 496 bytes rather than 752.** Every element
+  is the size of the largest kind, and the largest were the rare ones, so
+  `DisplayElement::Text` and `DisplayElement::PatternFill` now hold a
+  `Box` of their params, and `ClipParams::stroke_params` is an
+  `Option<Box<StrokeParams>>`. A page of a million fills holds about
+  250 MB less. Code that builds one of these wraps the params in
+  `Box::new`; code reading them is unchanged.
+- **`stet_core::graphics_state::PatternData` is `#[non_exhaustive]`.** It
+  gained `shading_background` in 0.8.5, a break accepted then with the
+  marker deferred to a breaking release. Build one from the new `Default`
+  (a coloured tiling pattern with an empty tile) and set its fields.
+- **`stet_core::context::Context::rand_seed` is gone**, replaced by
+  `rand_state` when `rand` became Ghostscript's generator (see Changed).
+- **`stet_ops::misc_ops::op_break` is gone**, with the `break` operator
+  it implemented (see Fixed).
+- **Three deprecated items are removed** (see Removed):
+  `stet_viewer::run_viewer`, `stet_pdf_reader::content::cid_unicode`, and
+  `stet_graphics::icc::intent_from_pdf_byte`.
+
+### Added
+
+- **`deny_host_access()` keeps documents away from the computer stet runs
+  on.** By default PostScript can read, write, delete and rename files,
+  as in Ghostscript with `-dNOSAFER`. A program rendering documents it did
+  not write calls `stet::deny_host_access()` (also in `stet_pdf_reader`
+  and `stet_fonts::host`) once, before the first document. For the rest of
+  the process, `file`, `run`, `deletefile` and `renamefile` raise
+  `invalidfileaccess`, `status` and `filenameforall` see only embedded
+  resources, `%stdin` reads as empty and a `%stdout` or `%stderr` file
+  discards what is written to it. No installed font, CMap file or system
+  color profile is read, by the PostScript interpreter or the PDF reader.
+  It cannot be undone. In the PDF reader it switches every document's
+  `set_host_files` off, and `host_files()` reports it. Contributed by
+  @nielsbosma (#21).
+- **`FileAccess::Safer` restricts one interpreter's file access the way
+  Ghostscript's `-dSAFER` does, without changing how pages render.**
+  `Interpreter::builder().safer()` (or `.file_access(FileAccess::Safer)`)
+  lets programs read only stet's resource folder, the installed fonts stet
+  has found, and what `Interpreter::permit_read`, `permit_write`,
+  `permit_control` and `permit_all` allow, each a folder and what is
+  inside it or one file, like Ghostscript's `--permit-file-read`,
+  `--permit-file-write`, `--permit-file-control` and `--permit-file-all`.
+  Any permit turns `Safer` on. Anything else is `invalidfileaccess`,
+  whether or not it exists, and `status` and `filenameforall` do not see
+  it. Symbolic links and `..` are resolved before a path is judged.
+  `renamefile` needs control on both names and write on the new one.
+  Unlike `deny_host_access()`, fonts, CMaps and colour profiles stet finds
+  itself are read as before, and `%stdin`, `%stdout` and `%stderr` work.
+  `stet_core::file_access` holds the rule; `Context` carries it as
+  `file_access` and `file_permits`, with `Context::permit`.
+- **`--safer`, `--permit-read`, `--permit-write`, `--permit-control` and
+  `--permit-all` on the command line**, for `stet` and `stet text`: the
+  same restriction, with Ghostscript's `-dSAFER` and `--permit-file-…`
+  meaning. Each permit takes a folder or one file, may be repeated, and
+  implies `--safer`; one naming a folder that does not exist stops the
+  command with an error. stet's own output (`-o`) is unaffected.
+- **`keep_partial_pages()` keeps what a job painted before an error.**
+  With `Interpreter::builder().keep_partial_pages()`, `render`,
+  `render_to_display_list` and `render_to_pdf` return the pages shown
+  before the error plus the one being painted when it happened, instead of
+  failing, and `Interpreter::last_error()` says what the error was. A job
+  stopped by its timeout ends the same way, with what it painted. Off by
+  default. Contributed by @nielsbosma (#22).
+- **`stet_render::render_region_with_background` renders a region
+  without the white paper.** With `PageBackground::Transparent` the
+  unpainted area stays clear and the result is straight-alpha RGBA, as for
+  a whole page from `render_to_rgba_with_background`; with `White` it is
+  `render_region`, whose output is unchanged. `image_samples_to_rgba`
+  gives a display-list image's samples as premultiplied RGBA, colour
+  converted and its colour key applied, for a consumer that takes images
+  out of a display list. Contributed by @nielsbosma (#23).
+
+### Changed
+
+- **`render_to_display_list` no longer holds each page twice.** The
+  page's display list goes to the caller, not a copy of it, so a page
+  with millions of marks needs far less memory: `mandelbrot.ps`, with
+  1,098,304 `rectfill`s, peaked at 1.6 GB rather than 2.7 GB. The browser
+  build keeps its pages the same way. A custom `OutputDevice` can take
+  part through the new `reads_display_list()`, which defaults to `true`;
+  a device that answers `false` is handed an empty list when display lists
+  are being captured. `DisplayList::shrink_to_fit` is also new.
+  Contributed by @nielsbosma (#37).
+- **`rand` gives Ghostscript's sequence, so a program drawing with it
+  draws what Ghostscript draws.** It is now Park and Miller's "minimal
+  standard" generator (multiplier 16807, modulus 2³¹−1), the one Adobe
+  documents and Ghostscript implements, starting from 1. `srand` brings
+  its seed into range as Ghostscript does, and `rrand` returns the
+  generator's current state, so handing it back to `srand` resumes the
+  sequence; it returned the last seed before. Any page drawn with
+  `rand` comes out differently from earlier versions of stet.
+  `stet_core::context::Context::rand_seed` is gone; `rand_state` holds
+  the state. Contributed by @nielsbosma (#30).
+- **A failed render names its PostScript error.** `render`,
+  `render_to_display_list` and `render_to_pdf` reported any error a
+  program raised as `PostScript error: stop`. They now give its name and
+  the command that raised it, such as `PostScript error: undefined in
+  nosuchoperator`. Code that matched the text `stop` needs updating.
+  Contributed by @nielsbosma (#22).
 - **`stet-fonts`, `stet-graphics`, `stet-pdf-reader` and `stet` are
   `#![forbid(unsafe_code)]`.** None contained any; the attribute keeps it
   that way.
@@ -52,12 +334,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Twardoch's archive, which offers the same files byte for byte under
   all three licences. The READMEs, which stated the OFL licensing without
   its basis, now point to it. The fonts are unchanged.
-- **`stet_graphics::color::CieDefParams` and `CieDefgParams` have new
-  public fields:** `range_hij` and `decode_def`, and `range_hijk` and
-  `decode_defg` — the `/RangeHIJ(K)` and `/DecodeDEF(G)` stages of their
-  colour spaces (see Fixed). Code that builds either with a struct literal
-  needs the fields. Both become `#[non_exhaustive]` at the next breaking
-  release, as `GraphicsState` did in 0.9.0.
 - **JPEG decoding moved into `stet-graphics` as `stet_graphics::jpeg`**
   (`decode`, `jpeg_dimensions`, `patch_jpeg_sof_height`), so the
   PostScript `DCTDecode` filter and the PDF reader share it (see Fixed).
@@ -67,7 +343,240 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turns on: a reader built without `parallel` no longer starts threads for
   JPEGs, and `stet-core` no longer depends on `jpeg-decoder` itself.
 
+### Removed
+
+- **Three items deprecated since 0.8.2 and 0.8.4:**
+  - `stet_viewer::run_viewer`; use `run_viewer_with_options`, which also
+    takes the black-point compensation mode.
+  - `stet_pdf_reader::content::cid_unicode` and its `cid_to_unicode` and
+    `unicode_to_cid`, which forwarded to `stet_fonts::cid_unicode`.
+  - `stet_graphics::icc::intent_from_pdf_byte`; display lists carry the
+    `stet_graphics::rendering_intent` encoding, read with `intent_from_byte`.
+
 ### Fixed
+
+- **`42 /FontType resourcestatus` reports that stet draws TrueType fonts.**
+  The `FontType` category listed only types 0 to 3, so a document asking
+  whether Type 42 fonts are supported was told no. Finale's PostScript
+  embeds each font both ways and keeps the Type 1 copy then, where
+  Ghostscript keeps the TrueType one. It now lists 2 (CFF), 9 and 11
+  (CIDFontType 0 and 2) and 42 as well.
+- **An unknown resource category is an `undefined` error.** `findresource`,
+  `defineresource` and `undefineresource` raised `undefinedresource` for a
+  category that does not exist, and `resourcestatus` and `resourceforall`
+  raised nothing, answering `false` and listing nothing. The PLRM (§3.9.2)
+  and Ghostscript give `undefined` for all five, keeping `undefinedresource`
+  for a known category without the instance asked for, and the operands now
+  stay on the stack as they do. `Category` itself now behaves as a category:
+  `/Category /Category findresource` finds it, `resourcestatus` and
+  `resourceforall` report the categories, and `undefineresource` removes
+  one. `resourceforall` lists the instances of an implicit category such as
+  `Filter` or `FontType`, which it listed none of before. The PLRM's
+  standard categories that were missing are defined: `FunctionType` (0, 2,
+  3), `ShadingType` (1–7), and `IODevice`, `TrappingType`, `InkParams` and
+  `TrapParams`, which have no instances, so a program probing them gets
+  `false` rather than an error.
+- **A loop run inside a procedure called many times no longer exhausts
+  memory.** The state of every `for`, `repeat`, `loop`, `forall` and
+  `pathforall` was kept until the job ended. ImageMagick writes a colour
+  image as `{ DirectClassPacket } false 3 colorimage`, a procedure called
+  once per pixel that runs a `for` each time, so an A3 page at 400 dpi
+  made 31 million loops, about 10 GB of state, and ran out of memory. The
+  states of loops that have ended are now dropped as the store grows: a
+  1000 × 1000 image of that shape peaks at 25 MB rather than 324 MB, and
+  the A3 page at 457 MB. Contributed by @nielsbosma (#43).
+- **A `CCITTFaxDecode` filter's data ends with the image.** Like
+  `DCTDecode`, the filter read its whole source before decoding, so a fax
+  image read straight from `currentfile` swallowed the rest of the
+  program and the page was never output. It now reads in growing chunks
+  until the image ends, at its end-of-block code or after its last row,
+  and leaves what follows, as Ghostscript does. PostScript and the PDF
+  reader now decode fax images with the same code, in a new
+  `stet_graphics::ccitt` module (hayro-ccitt, then the `fax` crate when
+  hayro rejects the data), so a fax image gives the same samples in both.
+  PostScript used only the `fax` crate before, which dropped the last
+  rows of an image with neither `Rows` nor an end-of-block code: the
+  glyphs of Type 3 fonts in Ghostscript's ps2write output lost up to six
+  rows each, and several pdftops pages with fax images that were mostly
+  wrong now match Ghostscript closely. A two-dimensional Group 3 image's
+  end-of-block code is read whole, where hayro-ccitt stopped after its
+  first EOL.
+- **A `DCTDecode` filter's data ends at the JPEG's end-of-image
+  marker.** The filter read its whole source before decoding, so a JPEG
+  read straight from `currentfile`, as an EPS can inline one, swallowed
+  the rest of the program, and the page was never output. It now reads
+  the JPEG through its end marker, skipping marker segments by their
+  length, and leaves what follows, as Ghostscript does.
+- **An Indexed space may have up to 4096 entries, and an image in one
+  takes its indices through its `Decode`.** `setcolorspace` refused a
+  palette past 256 entries with `rangecheck`, though PLRM 3e §4.8.4
+  allows `hival` up to 4095 for 12-bit images. An image's `Decode` was
+  ignored, and a 12- or 16-bit index was cut to its high 8 bits, so index
+  5 of a 16-bit image drew entry 0. Each sample is now decoded to an
+  index, rounded and clipped as `setcolor` takes one; an image over a
+  palette of more than 256 entries is drawn in the palette's base space.
+- **An Indexed colour over a CIE-based, ICCBased, Separation or DeviceN
+  base is drawn in that base.** Only a DeviceGray, DeviceRGB or
+  DeviceCMYK base was looked up: over any other a fill came out black,
+  an image drew the palette's bytes as RGB, and a mesh shading drew the
+  index as a gray. A lookup procedure's results were also clipped to
+  0-1, so a Lab palette, which PLRM 3e §4.8.4 says to give as a
+  procedure, lost its values. Fills, the initial colour, images and mesh
+  shadings now take each entry through the base space, running its tint
+  transform where it has one, and PDF output keeps a palette over a spot
+  colour or an ICC profile in that space.
+- **A spot colour whose alternate space is CIE-based is drawn in that
+  space.** The tint transform's results were taken by their number
+  alone, as one gray, three RGB or four CMYK values clamped to 0-1.
+  pdftops writes an InDesign spot colour as a Separation over a
+  CIEBasedABC space set up as Lab, so a green (L* 52, a* -67, b* 34)
+  became RGB (1, 0, 1): every green spot colour on such a page came out
+  magenta. Fills, images and PDF output now convert through the
+  alternate space, and a fill in a Separation or DeviceN colour over an
+  ICCBased space goes through its profile.
+- **Mesh shadings (Types 4 to 7) with a `Function` are drawn.** Each
+  vertex of such a shading carries a parametric value t, and the function
+  gives its colour. stet read t as colour components and drew nothing
+  where Ghostscript draws the gradient. The shading now gets a colour
+  table over t, as the PDF reader gives one, so a function with several
+  stops is drawn through all of them, not only at the vertices, and PDF
+  output keeps the function.
+- **A shading's `Function` may be an array of functions**, one
+  per colour component, as PLRM 3e §4.9.3 allows. stet ran the array as
+  a procedure and stopped with `stackunderflow`. This applies to every
+  shading type.
+- **Mesh shadings (Types 4 to 7) read from a string or file give each
+  vertex the colour its colour space gives it.** stet took the colour
+  from the number of components alone: one component became a gray, so a
+  full Separation or DeviceN tint drew white, and four went through a
+  rough CMYK formula rather than the CMYK profile fills and the other
+  shadings use. Each vertex now goes through the tint transform and the
+  colour space, as a fill does. Illustrator's gradient meshes, in a
+  Separation space read through a filter, drew white where Ghostscript
+  draws them in their spot colour. An array `DataSource` in DeviceCMYK or
+  an ICC space also changes: one ICCBased mesh that drew blue to red now
+  draws cyan to yellow, as Ghostscript does. Contributed by @nielsbosma
+  (#41).
+- **ASCII85Decode, ASCIIHexDecode and RunLengthDecode take their
+  end-of-data marker when the data fills their buffer exactly.** Each
+  decodes 4096 bytes at a time. When a program's data came to a multiple
+  of that and it read exactly that much, the filter never read again, so
+  the marker (`~>`, `>` or the byte 128) stayed in the file. The
+  interpreter then read it as program text and stopped with `undefined`
+  or `syntaxerror`, and every page after was lost. Illustrator's images
+  and GIMP's EPS, which opens a new filter for each row, hit this. After
+  a full buffer, each filter now looks for its marker, as Ghostscript
+  does. Contributed by @nielsbosma (#40), for ASCII85Decode.
+- **Reading from `%stdin` or a pipe no longer loses a byte after a token
+  or a line.** The scanner reads one byte past a token to find its end,
+  and `readline` one past a CR to see whether an LF follows. Each then
+  puts that byte back, which worked for a disk file by seeking back, but
+  `%stdin` cannot seek and seeking a pipe fails, so the byte was
+  dropped. `abc/def` read from standard input scanned as `abc` and `def`
+  instead of `abc` and `/def`, and `readline` gave `(d)` for `cd` after a
+  lone CR. Bytes put back on a disk file or `%stdin` are now kept and
+  read again first, and `fileposition` and `bytesavailable` count them.
+- **`break` is no longer defined, so Illustrator 3 to 5.5 EPS files
+  finish.** Their pattern prolog, Adobe_pattern_AI3, leaves a loop by
+  calling `break` inside `stopped`, relying on it being undefined, as it
+  is on Adobe's printers and in Ghostscript. stet defined it as a
+  debugging no-op, so the loop never ended and the file ran until the
+  time limit. The debugging hook is now `.break`: it still does nothing,
+  and a native debugger can stop on `stet_ops::misc_ops::op_dot_break`
+  where a program calls it. Contributed by @nielsbosma (#39).
+- **Text in a PDF font that isn't embedded is no longer lost when the
+  machine's copy of the stand-in font is OpenType.** The PDF reader
+  draws such a font, Helvetica say, with a Nimbus font, and looks for it
+  among the installed fonts before its own. The URW fonts are often
+  installed as both Type 1 and OpenType, and which file the reader found
+  depended on the order the machine listed its font folders in. Given
+  the OpenType one, it could not read it as Type 1 and drew none of the
+  text, warning only that a FontFile was missing. It now passes over a
+  font it cannot read and takes the next source, ending with its own
+  copy. The same holds for a font a `FontProvider` supplies.
+- **`closepath` does nothing when the path is empty or the current
+  subpath is already closed**, as the PLRM says and as in Ghostscript.
+  stet added a close either way. Rendered pages didn't change, but the
+  path did: `pathforall` reported the extra closes, `pathbbox` of an
+  empty path returned a box instead of raising `nocurrentpoint`, and
+  SVG output dropped every shape whose path began with a stray close,
+  925 of 1,515 in one sign-making EPS. Contributed by @nielsbosma (#35).
+- **A segment appended straight after `closepath` begins a new subpath
+  with a `moveto`**, at the closed subpath's start, as the PLRM says and
+  as Ghostscript records it. This covers `lineto`, `rlineto`, `curveto`,
+  `rcurveto`, `arc`, `arcn`, `arcto` and `arct`. stet ran the new
+  segments on from the closed subpath, so `pathforall` and `upath`
+  returned a subpath with no `moveto`, `reversepath` joined the two into
+  one open subpath and lost the close, and `strokepath` outlined them as
+  one subpath.
+- **`arcto` and `arct` raise `undefinedresult` when a tangent line has no
+  direction**, because the current point, or the second point, lies on
+  the corner. Ghostscript raises the same error, citing Adobe's
+  conformance tests. stet drew a straight line to the corner instead.
+  The operands and the current path are left as they were. No file in
+  our 6,239-file PostScript corpus reaches this case.
+- **A line end inside a PostScript string literal is one newline,
+  whether it is a CR, an LF or a CR LF**, as PLRM 3.2.2 has it and as in
+  Ghostscript. stet kept both bytes of a CR LF and left a lone CR as it
+  was, so in a file saved with Windows line ends each multi-line string
+  grew by a byte per line, and a program that walks a string character
+  by character went wrong. Both scanners are fixed, the one reading a
+  file and the one `token` and `cvx exec` use on a string. Contributed
+  by @nielsbosma (#31).
+- **A `findresource` that fails leaves its key and category on the
+  operand stack**, as the PLRM has every failing operator do, and as
+  Ghostscript does. stet left only the key (nothing for `/Category`), so
+  the common probe `{ /OCProcSet /ProcSet findresource } stopped { pop
+  pop … }`, which Intergraph's map plots and other prologs use, stopped
+  at `stackunderflow`. A program that popped one object after a failed
+  `findresource` now needs to pop two, as it already does under
+  Ghostscript. `findencoding` still leaves just the key, as in
+  Ghostscript, and now reports the error as its own. Contributed by
+  @nielsbosma (#28).
+- **`setpagedevice` with an `/OutputDevice` stet has no resource for no
+  longer leaves stray objects on the operand stack.** It falls back to
+  the request alone, as before.
+- **`SubFileDecode` finds its end-of-data marker wherever it falls.**
+  The filter reads its source 4096 bytes at a time and forgot a partial
+  match between reads, so a marker that crossed that boundary was missed
+  and the filter read to the end of its source. A marker straight after a
+  false start, such as `%  &&end` inside `%%  &&end`, was also missed.
+  Illustrator EPS files skip their XMP packet with
+  `currentfile 0 (%  &&end XMP packet marker&&) /SubFileDecode filter
+  flushfile`, and when either case hit, the rest of the file was
+  skipped and the page came out blank, with no error. A partial marker at
+  the end of the source is now passed through as data, and with
+  `EODCount` above 0 the count carries across reads. Contributed by
+  @nielsbosma (#26).
+- **`findcolorrendering` returns a name and a boolean, as the PLRM
+  defines it, and the `/ColorRendering /ProcSet` resource exists.**
+  `intent findcolorrendering` gives the name `intent.device.halftone` and
+  `true` when a ColorRendering resource has that name, and otherwise the
+  ProcSet's `GetSubstituteCRD` result (`/DefaultColorRendering`, now
+  embedded) and `false`. It returned a CRD dictionary before, or raised
+  `undefinedresource`. EPS files from Illustrator and CorelDRAW, whose
+  prologs replace `GetSubstituteCRD` in that ProcSet, stopped at
+  `undefinedresource` before drawing anything; they now render. stet
+  still does not convert colours through a CRD, so rendering is otherwise
+  unchanged. Contributed by @nielsbosma (#24).
+- **A TrueType or OpenType font added to an on-disk `resources/Font`
+  folder loads.** `findfont` found it there but then looked for the file
+  in the working directory, so the font was reported not found and
+  substituted. `.t1` fonts in the same folder were not affected. It is
+  now found where `status` and `run` find a file.
+
+- **A resource or font name no longer reaches a file outside its folder.**
+  A resource not yet loaded is looked for in `resources/<Category>/<key>`,
+  and a font in `resources/Font/<name>`, so a key such as
+  `(../../x) cvn` ran a file beside the folder. A name holding `/` or `\`
+  is now not looked for on disk: `findresource` raises
+  `undefinedresource` and `findfont` substitutes, as for any resource or
+  font not found. `.loadfont` refuses such a name too, and
+  `.loadbinaryfontfile` reads from disk only a file directly in
+  `resources/Font/`. Real font and resource names never hold a separator.
+  PostScript can open files with `file` and `run` anyway, so this closes
+  nothing today. It matters for the restricted mode planned next, which
+  refuses those but keeps font lookups.
 
 - **Print drivers' Level 1 tray and duplex calls work.** A job calling
   `0 statusdict /setpapertray get exec`, as Oracle Toolkit's output does,

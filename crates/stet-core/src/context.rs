@@ -121,6 +121,10 @@ struct GstateBackup {
     state: GraphicsState,
 }
 
+/// [`Context::sfnts_cache`]: a font file by its `sfnts` array (entity, start,
+/// length).
+pub type SfntsCache = rustc_hash::FxHashMap<(EntityId, u32, u32), std::sync::Arc<[u8]>>;
+
 pub struct Context {
     // Stacks
     pub o_stack: Stack,
@@ -150,8 +154,6 @@ pub struct Context {
     // State
     /// State of `rand`'s generator (1..2^31-2), returned by `rrand`.
     pub rand_state: u64,
-    /// The same state as `rand_state`, kept for callers that read it.
-    pub rand_seed: i64,
     /// Current source line number (1-based), updated during scanning.
     pub current_source_line: u32,
     /// Packing mode for array/procedure creation (setpacking/currentpacking).
@@ -318,6 +320,14 @@ pub struct Context {
     pub category_registry: EntityId,
     pub resource_base_path: Option<String>,
 
+    /// How much of the host's file system PostScript's file operators
+    /// reach: see [`crate::file_access`]. [`Self::permit`] sets it to
+    /// `Safer`.
+    pub file_access: crate::file_access::FileAccess,
+    /// What a program may read, write and control under
+    /// [`FileAccess::Safer`](crate::file_access::FileAccess::Safer).
+    pub file_permits: crate::file_access::FilePermits,
+
     // Parameter system
     pub user_params: EntityId,
     pub system_params: EntityId,
@@ -349,20 +359,19 @@ pub struct Context {
 
     // Glyph path cache: per-font charstring interpretation results
     pub glyph_caches: rustc_hash::FxHashMap<EntityId, crate::glyph_cache::GlyphCache>,
+    /// Each CMap's codespace and CID mappings, by CMap dictionary, read the
+    /// first time text is shown with it (see [`crate::cmap`]).
+    pub cmap_tables: rustc_hash::FxHashMap<EntityId, std::sync::Arc<crate::cmap::CmapTables>>,
     /// Type 42 and Type 2 CIDFont font files: each `sfnts` array (entity,
     /// start, length) joined once, not once per `show`. Keyed by the array,
     /// not the font, because `scalefont` and `makefont` copy the font
     /// dictionary but share the array: a 4 MB CJK font shown a glyph at a
-    /// time otherwise copied 4 MB per glyph.
-    pub sfnts_cache: rustc_hash::FxHashMap<(EntityId, u32, u32), std::sync::Arc<Vec<u8>>>,
-    /// Each CMap dictionary's codespace and mappings, read once rather than
-    /// on every `show`, `stringwidth` or `charpath` (a CJK CMap holds
-    /// thousands of ranges). Keyed by the CMap dictionary; the tables are
-    /// the show operators' own type, hence `Any`. Behind a lock because the
-    /// decoders only borrow the context.
-    pub cmap_tables: std::sync::Mutex<
-        rustc_hash::FxHashMap<EntityId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
-    >,
+    /// time otherwise copied 4 MB per glyph. Behind a lock because the show
+    /// operators only borrow the context.
+    pub sfnts_cache: std::sync::Mutex<SfntsCache>,
+    /// The Type 0 font `glyphshow` shows a CID through, by CIDFont: the
+    /// CIDFont composed with Identity-H (Identity-V for WMode 1), once.
+    pub cid_glyphshow_fonts: rustc_hash::FxHashMap<EntityId, PsObject>,
     /// The metrics show operators gave CIDFont glyphs through the font's
     /// `Metrics2` or `CDevProc` (PLRM 5.9.2), by CIDFont and CID. An output
     /// device that writes the font rather than its outlines — PDF output —
@@ -481,8 +490,9 @@ pub struct Context {
     /// and its large canvas ten times that, and their EPS files declare that
     /// bounding box. The points come from the file; the render resolution is
     /// the caller's and is not capped (see `stet_ops::device_ops`).
+    /// `f64::INFINITY` lifts the limit; a value that is not greater than zero
+    /// (NaN included) counts as [`DEFAULT_MAX_PAGE_SIZE_POINTS`].
     pub max_page_size_points: f64,
-
     /// Whether `image` keeps a JPEG image as its JPEG data instead of its
     /// samples, for a display-list consumer that writes JPEG out as it is
     /// (see `ImageParams::jpeg`). Off by default.
@@ -651,7 +661,16 @@ pub enum GroupKind {
     /// Opened by `begintransparencygroup`. On close, the captured
     /// `display_list` becomes the children of a
     /// `DisplayElement::Group` with these `params`.
-    Transparency { params: GroupParams },
+    ///
+    /// `composite_at_begin` is set by Ghostscript's
+    /// `.begintransparencygroup`, which composites the group with the fill
+    /// opacity and blend mode current when it began: they are in `params`
+    /// from the start and stay. Otherwise they are read from the gstate when
+    /// the group ends, as PDF's `q … Q` around `Do` needs.
+    Transparency {
+        params: GroupParams,
+        composite_at_begin: bool,
+    },
     /// Opened by `beginsoftmask`. While active, paint ops emit into the
     /// frame's `display_list` to build the mask form. `endsoftmask`
     /// transmutes the frame to [`Self::Masked`] without popping.
@@ -766,6 +785,31 @@ const DEFAULT_MAX_LOCAL_VM: usize = {
 pub const DEFAULT_MAX_PAGE_SIZE_POINTS: f64 = 14_400.0;
 
 impl Context {
+    /// Permit a program `access` to `path` (a folder and what is inside it,
+    /// or one file), and restrict it to what is permitted:
+    /// [`file_access`](Self::file_access) becomes `Safer`. See
+    /// [`FilePermits::add`](crate::file_access::FilePermits::add) for the
+    /// error.
+    pub fn permit(
+        &mut self,
+        access: crate::file_access::Access,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        self.file_permits.add(access, path)?;
+        self.file_access = crate::file_access::FileAccess::Safer;
+        Ok(())
+    }
+
+    /// The rule the file operators apply to host files: see
+    /// [`crate::file_access`].
+    pub fn host_policy(&self) -> crate::file_access::HostPolicy<'_> {
+        crate::file_access::HostPolicy::new(
+            self.file_access,
+            &self.file_permits,
+            self.resource_base_path.as_deref(),
+        )
+    }
+
     /// Stop interpreting once `limit` has elapsed from now.
     ///
     /// Raises [`PsError::Timeout`] from the eval loop when the deadline
@@ -1364,7 +1408,6 @@ impl Context {
             errordict,
             dollar_error,
             rand_state: 1,
-            rand_seed: 1,
             current_source_line: 1,
             packing_mode: false,
             echo: false,
@@ -1410,6 +1453,8 @@ impl Context {
             local_resources,
             category_registry,
             resource_base_path: None,
+            file_access: crate::file_access::FileAccess::Full,
+            file_permits: crate::file_access::FilePermits::new(),
             user_params,
             system_params,
             internaldict,
@@ -1419,8 +1464,9 @@ impl Context {
             char_bbox: None,
             char_width_mode1: None,
             glyph_caches: rustc_hash::FxHashMap::default(),
-            sfnts_cache: rustc_hash::FxHashMap::default(),
-            cmap_tables: std::sync::Mutex::default(),
+            cmap_tables: rustc_hash::FxHashMap::default(),
+            sfnts_cache: std::sync::Mutex::default(),
+            cid_glyphshow_fonts: rustc_hash::FxHashMap::default(),
             cid_glyph_metrics: rustc_hash::FxHashMap::default(),
             font_snapshots: crate::font_snapshot::FontSnapshots::default(),
             char_cache_mode: None,
@@ -1862,13 +1908,15 @@ impl Context {
         let dict_mark = marks.dict_entities;
         let live_dict = |e: &EntityId| e.is_global() || e.raw_index() < dict_mark;
         self.glyph_caches.retain(|entity, _| live_dict(entity));
-        self.form_cache.retain(|entity, _| live_dict(entity));
-        if let Ok(tables) = self.cmap_tables.get_mut() {
-            tables.retain(|entity, _| live_dict(entity));
-        }
+        self.cmap_tables.retain(|entity, _| live_dict(entity));
         let array_mark = marks.array_entities;
-        self.sfnts_cache
-            .retain(|(e, _, _), _| e.is_global() || e.raw_index() < array_mark);
+        if let Ok(sfnts) = self.sfnts_cache.get_mut() {
+            sfnts.retain(|(e, _, _), _| e.is_global() || e.raw_index() < array_mark);
+        }
+        self.cid_glyphshow_fonts.retain(|cidfont, font| {
+            live_dict(cidfont) && matches!(font.value, PsValue::Dict(e) if live_dict(&e))
+        });
+        self.form_cache.retain(|entity, _| live_dict(entity));
         self.cid_glyph_metrics
             .retain(|(cidfont, _), _| live_dict(cidfont));
 

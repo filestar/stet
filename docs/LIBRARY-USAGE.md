@@ -6,7 +6,7 @@ install options, and what stet is, see the [README](../README.md).
 
 ```toml
 [dependencies]
-stet = "0.9"
+stet = "0.11"
 ```
 
 > **Upgrading?** Cargo will not auto-bump across these pre-1.0 minors, each
@@ -133,6 +133,12 @@ let rgba = stet::render_region_prepared(
     150.0, None, None, false,
 );
 ```
+
+The region is composited onto white paper. To leave its unpainted area
+clear instead, for a region placed over other content, render it with
+`stet_render::render_region_with_background` and
+`PageBackground::Transparent`: the result is straight-alpha RGBA, as from
+`render_to_rgba_with_background`. It takes the display list unprepared.
 
 ## PDF Reader
 
@@ -292,7 +298,7 @@ For the smallest dependency footprint (display lists only):
 
 ```toml
 [dependencies]
-stet = { version = "0.9", default-features = false }
+stet = { version = "0.11", default-features = false }
 ```
 
 ## Configuration
@@ -303,6 +309,68 @@ let mut interp = stet::Interpreter::builder()
     .suppress_output()    // silence PS print/==/= operators
     .build();
 ```
+
+### Untrusted documents
+
+PostScript has file access: by default a program can read, write, delete
+and rename files with `file`, `run`, `deletefile` and `renamefile`, as it
+can in Ghostscript with `-dNOSAFER`. There are two ways to restrict it.
+
+**`safer()`** is Ghostscript's `-dSAFER`, for one interpreter. A program
+reads only stet's own resources and the installed fonts, and writes,
+deletes and renames nothing, except what the interpreter's permits allow:
+a folder and everything in it, or one file, like Ghostscript's
+`--permit-file-read`, `--permit-file-write` and `--permit-file-control`.
+
+```rust
+let mut interp = stet::Interpreter::builder().safer().build();
+interp.permit_read("job/prologs")?; // also permit_write, permit_control, permit_all
+```
+
+Anything else raises `invalidfileaccess`, whether or not the file exists,
+and `status` and `filenameforall` do not see it. Fonts, CMaps and colour
+profiles stet finds itself are read as before, so pages render the same,
+and `%stdin`, `%stdout` and `%stderr` still work. Any `permit_…` call turns
+`safer()` on, and fails when the folder it names does not exist.
+
+**`deny_host_access()`** goes further, for the whole process. Called once,
+before the first document, it refuses every file a document names, empties
+`%stdin`, discards what is written to a `%stdout` or `%stderr` file, and
+reads no installed font, CMap file or system color profile, in the
+PostScript interpreter or the PDF reader: stet's bundled ones are used, so
+output is the same on every machine. It cannot be undone, and no permit
+lifts it.
+
+```rust
+stet::deny_host_access();
+```
+
+Neither limits how long a document runs or how much memory it takes: set
+`PsContext::set_timeout` before each job, and `PsContext::max_local_vm`,
+through `interp.context()`. The page a PostScript file may declare is
+bounded already, at 14400 pt (200 inches) a side; `max_page_size(points)`
+raises that for large-format artwork.
+
+### Page size
+
+A PostScript job that asks for no page size prints on Letter (612 × 792
+pt), as on a printer loaded with Letter paper — Ghostscript does the
+same. `default_page_size` gives such jobs a different page:
+
+```rust
+let mut interp = stet::Interpreter::builder()
+    .default_page_size(842.0, 1191.0) // A3
+    .build();
+```
+
+It is a default, not an override: a program's own `setpagedevice` still
+changes the page, and an EPS file still gets its `%%BoundingBox`. (The
+CLI's `--page` overrides both.) Some files draw beyond Letter without
+asking for anything larger — ImageMagick writes an A3 image with an A3
+`%%BoundingBox` and no `setpagedevice` — but a DSC bounding box is not
+reliable enough to follow on its own, so stet leaves the choice to the
+caller. Like a page the file declares, the default is clamped to
+`max_page_size` (14400 pt a side unless raised).
 
 ### Rendering intent
 

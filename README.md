@@ -3,7 +3,7 @@
 <p align="center">A pure-Rust graphics engine for PDF, PostScript, and EPS.</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-0.9.0-blue" alt="Version 0.9.0">
+  <img src="https://img.shields.io/badge/Version-0.11.0-blue" alt="Version 0.11.0">
   <img src="https://img.shields.io/badge/License-Apache--2.0_OR_MIT-green" alt="License Apache-2.0 OR MIT">
   <img src="https://img.shields.io/badge/Rust-1.92+-orange" alt="Rust 1.92+">
 </p>
@@ -76,9 +76,9 @@ there is nothing to install alongside it.
 in — the rest of the command is the same for all four:
 
 ```bash
-ASSET=stet-0.9.0-x86_64-unknown-linux-musl.tar.gz     # see the table above
+ASSET=stet-0.11.0-x86_64-unknown-linux-musl.tar.gz     # see the table above
 
-curl -fL "https://github.com/AndyCappDev/stet/releases/download/v0.9.0/$ASSET" | tar xz
+curl -fL "https://github.com/AndyCappDev/stet/releases/download/v0.11.0/$ASSET" | tar xz
 cd "${ASSET%.tar.gz}"
 ./stet --version
 ```
@@ -102,9 +102,9 @@ different arguments — so call `curl.exe` explicitly. Windows 10 1803 and later
 ship both it and `tar`:
 
 ```powershell
-curl.exe -fL -O https://github.com/AndyCappDev/stet/releases/download/v0.9.0/stet-0.9.0-x86_64-pc-windows-msvc.zip
-tar -xf stet-0.9.0-x86_64-pc-windows-msvc.zip
-cd stet-0.9.0-x86_64-pc-windows-msvc
+curl.exe -fL -O https://github.com/AndyCappDev/stet/releases/download/v0.11.0/stet-0.11.0-x86_64-pc-windows-msvc.zip
+tar -xf stet-0.11.0-x86_64-pc-windows-msvc.zip
+cd stet-0.11.0-x86_64-pc-windows-msvc
 .\stet.exe --version
 ```
 
@@ -118,8 +118,8 @@ every archive. The quick commands above stream the archive straight into
 file first:
 
 ```bash
-ASSET=stet-0.9.0-x86_64-unknown-linux-musl.tar.gz     # see the table above
-URL=https://github.com/AndyCappDev/stet/releases/download/v0.9.0/
+ASSET=stet-0.11.0-x86_64-unknown-linux-musl.tar.gz     # see the table above
+URL=https://github.com/AndyCappDev/stet/releases/download/v0.11.0/
 
 curl -fL -O "$URL$ASSET"
 curl -fL -O "${URL}SHA256SUMS"
@@ -134,8 +134,8 @@ an upper-case digest while `SHA256SUMS` is lower-case, so compare them
 case-folded:
 
 ```powershell
-$name = "stet-0.9.0-x86_64-pc-windows-msvc.zip"
-curl.exe -fL -O https://github.com/AndyCappDev/stet/releases/download/v0.9.0/SHA256SUMS
+$name = "stet-0.11.0-x86_64-pc-windows-msvc.zip"
+curl.exe -fL -O https://github.com/AndyCappDev/stet/releases/download/v0.11.0/SHA256SUMS
 $want = ((Select-String -Path SHA256SUMS -SimpleMatch $name).Line -split '\s+')[0]
 $got  = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
 if ($got -eq $want) { "OK" } else { "MISMATCH" }
@@ -208,9 +208,15 @@ zoom presets, minimap navigation, and drag-and-drop.
 | `--default-intent <relative\|perceptual\|saturation\|absolute>` | Rendering intent pages start with (default: `relative`): which of a CMYK profile's tables converts CMYK colour. A document's own intent (`ri`, `/RI`, an image's `/Intent`, `setrenderingintent`) still wins |
 | `--password <PW>` | Password for encrypted PDF input |
 | `--timeout <SECONDS>` | Abort a job running longer than this. No limit by default — PostScript is Turing-complete and legitimate jobs run for minutes. Set one for untrusted input |
+| `--safer` | Restrict PostScript's file operators as Ghostscript's `-dSAFER` does: a program reads only stet's resources and the installed fonts, and writes, deletes and renames nothing. Fonts and colour profiles stet finds itself are still used, so pages render the same. Output (`-o`) is not affected |
+| `--permit-read <PATH>` | Let programs read `PATH`, a folder and everything in it or one file. Implies `--safer`; may be repeated. Ghostscript's `--permit-file-read` |
+| `--permit-write <PATH>` | Let programs write `PATH` (a file need not exist yet). Implies `--safer`; may be repeated |
+| `--permit-control <PATH>` | Let programs delete and rename files in `PATH`. Implies `--safer`; may be repeated |
+| `--permit-all <PATH>` | `--permit-read`, `--permit-write` and `--permit-control` at once |
 | `--json` | `stet text` only: print JSON with each line's position instead of plain text. See [`stet text`](#stet-text-file) |
 | `--word-boxes` | `stet text --json` only: give each word its position too |
 | `--max-vm <MB>` | Ceiling on PostScript VM — strings, arrays, dictionaries (default 8192). Exceeding it raises `VMerror` instead of aborting. Separate from the renderer's image and band buffers, so it does **not** cap rendering resolution |
+| `--max-page-size <PT>` | Largest page side PostScript/EPS input may declare, in points (default 14400, 200 inches). A larger page is clamped and loses what lies beyond it; `inf` removes the limit. Raise it for large-format artwork — Illustrator artboards reach 16383 pt. Rendering resolution is not capped either way |
 
 ### Choosing where output goes
 
@@ -294,7 +300,7 @@ document.pdf
 Metadata:
   Title: Annual Report 2026
   Author: Scott Bowman
-  Producer: stet 0.9.0
+  Producer: stet 0.11.0
   Created: 2026-04-27 12:00:00 UTC
 
 Pages: 4
@@ -451,7 +457,7 @@ these matter more than raw rendering speed.
 
 ```toml
 [dependencies]
-stet = "0.9"
+stet = "0.11"
 ```
 
 ```rust

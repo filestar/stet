@@ -1032,9 +1032,8 @@ fn type42_widths(
 /// The tag is the same for the same font and glyphs, so output is
 /// reproducible; a name that already carries a tag keeps it.
 fn subset_name(name: &[u8], resource: &str, codes: &HashSet<u16>) -> Vec<u8> {
-    let tagged = name.len() > 7
-        && name[6] == b'+'
-        && name[..6].iter().all(|c| c.is_ascii_uppercase());
+    let tagged =
+        name.len() > 7 && name[6] == b'+' && name[..6].iter().all(|c| c.is_ascii_uppercase());
     if tagged {
         return name.to_vec();
     }
@@ -1778,7 +1777,11 @@ fn reconstruct_truetype(
 
 /// A font's GlyphDirectory entry for `gid` (PLRM 3e §5.9.2: a dictionary
 /// or an array of glyph descriptions), when it has a non-empty one.
-fn glyph_directory_entry<'d>(fonts: &FontData, font: &'d FrozenDict, gid: usize) -> Option<&'d [u8]> {
+fn glyph_directory_entry<'d>(
+    fonts: &FontData,
+    font: &'d FrozenDict,
+    gid: usize,
+) -> Option<&'d [u8]> {
     let entry = match fonts.get(font, b"GlyphDirectory")? {
         Frozen::Array(items) => items.get(gid),
         _ => dict_of(fonts, font, b"GlyphDirectory")?.get(&DictKey::Int(gid as i64)),
@@ -1909,8 +1912,10 @@ fn with_symbolic_cmap(
     }
 
     let mac: Vec<(u16, u16)> = code_gids.iter().map(|(&c, &g)| (c as u16, g)).collect();
-    let windows: Vec<(u16, u16)> =
-        code_gids.iter().map(|(&c, &g)| (0xF000 + c as u16, g)).collect();
+    let windows: Vec<(u16, u16)> = code_gids
+        .iter()
+        .map(|(&c, &g)| (0xF000 + c as u16, g))
+        .collect();
     let mac_sub = cmap_format4(&mac);
     let win_sub = cmap_format4(&windows);
     let mut cmap = Vec::with_capacity(20 + mac_sub.len() + win_sub.len());
@@ -2789,7 +2794,10 @@ fn build_type42_font(writer: &mut PdfWriter, usage: &FontUsage, fonts: &FontData
             (b"Type".to_vec(), PdfObj::name("FontDescriptor")),
             (b"FontName".to_vec(), PdfObj::Name(base_font.clone())),
             // Symbolic: the font's own cmap maps the codes; Nonsymbolic: names through the Encoding
-            (b"Flags".to_vec(), PdfObj::Int(if symbolic { 0x0004 } else { 0x0020 })),
+            (
+                b"Flags".to_vec(),
+                PdfObj::Int(if symbolic { 0x0004 } else { 0x0020 }),
+            ),
             (
                 b"FontBBox".to_vec(),
                 PdfObj::Array(bbox.iter().map(|&v| PdfObj::Real(v)).collect()),

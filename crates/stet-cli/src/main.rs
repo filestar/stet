@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use stet_core::context::Context;
 use stet_core::eps::{content_is_epsf, read_eps_bounding_box, strip_dos_eps_header};
+use stet_core::file_access::{Access, FileAccess, FilePermits};
 use stet_engine::eval::{parse_and_exec, parse_and_exec_file};
 use stet_graphics::icc::{BpcMode, IccCacheOptions};
 use stet_graphics::rendering_intent::RenderingIntent;
@@ -148,6 +149,13 @@ fn main() {
     // Ceiling on PostScript VM. `None` keeps Context's own default, which is
     // generous rather than absent — see `Context::max_local_vm`.
     let mut max_vm_mb: Option<u64> = None;
+    // Largest page side a file may declare. `None` keeps Context's default,
+    // 14400 pt — see `Context::max_page_size_points`.
+    let mut max_page_size_points: Option<f64> = None;
+    // `--safer` and the `--permit-…` flags: what PostScript's file
+    // operators reach. Full by default, as before.
+    let mut file_access = FileAccess::Full;
+    let mut file_permits = FilePermits::new();
     let mut password: Option<String> = None;
     let mut target_width: Option<u32> = None;
     let mut target_height: Option<u32> = None;
@@ -156,6 +164,12 @@ fn main() {
     let mut file_args: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
+        if let Some(taken) =
+            file_access_flag(args.as_slice(), i, &mut file_access, &mut file_permits)
+        {
+            i += taken;
+            continue;
+        }
         match args[i].as_str() {
             "--page" => {
                 if i + 1 < args.len() {
@@ -339,6 +353,28 @@ fn main() {
                     }
                 } else {
                     eprintln!("Error: --max-vm requires a value in megabytes");
+                    std::process::exit(1);
+                }
+            }
+            "--max-page-size" => {
+                if i + 1 < args.len() {
+                    // `f64` parsing takes "inf", which lifts the limit.
+                    match args[i + 1].parse::<f64>() {
+                        Ok(points) if points > 0.0 => {
+                            max_page_size_points = Some(points);
+                            i += 2;
+                            continue;
+                        }
+                        _ => {
+                            eprintln!(
+                                "Error: --max-page-size requires a positive size in points, \
+                                 or inf for no limit"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("Error: --max-page-size requires a value in points");
                     std::process::exit(1);
                 }
             }
@@ -622,6 +658,14 @@ writes all pages to one file",
         }
     }
 
+    let limits = JobLimits {
+        timeout_secs,
+        max_vm_mb,
+        max_page_size_points,
+        file_access,
+        file_permits,
+    };
+
     match device.as_str() {
         "png" => {
             run_png_mode(
@@ -638,8 +682,7 @@ writes all pages to one file",
                 target_width,
                 target_height,
                 page_size,
-                timeout_secs,
-                max_vm_mb,
+                &limits,
                 output_template,
             );
         }
@@ -661,8 +704,7 @@ writes all pages to one file",
                 target_width,
                 target_height,
                 page_size,
-                timeout_secs,
-                max_vm_mb,
+                &limits,
                 output_template,
             );
         }
@@ -698,8 +740,7 @@ writes all pages to one file",
                     no_aa,
                     page_filter,
                     page_size,
-                    timeout_secs,
-                    max_vm_mb,
+                    &limits,
                     output_template,
                 );
             }
@@ -712,8 +753,7 @@ writes all pages to one file",
                 no_aa,
                 page_filter,
                 page_size,
-                timeout_secs,
-                max_vm_mb,
+                &limits,
             );
         }
         #[cfg(feature = "viewer")]
@@ -725,8 +765,7 @@ writes all pages to one file",
             page_filter,
             password,
             page_size,
-            timeout_secs,
-            max_vm_mb,
+            &limits,
         ),
         #[cfg(not(feature = "viewer"))]
         "viewer" => {
@@ -760,8 +799,7 @@ fn run_png_mode(
     target_width: Option<u32>,
     target_height: Option<u32>,
     page_size: Option<(f64, f64)>,
-    timeout_secs: Option<f64>,
-    max_vm_mb: Option<u64>,
+    limits: &JobLimits,
     output_template: Option<stet_core::output_template::OutputTemplate>,
 ) {
     // Check if all files are PDFs — use fast path (no PS interpreter needed)
@@ -792,7 +830,7 @@ fn run_png_mode(
         std::process::exit(1);
     }
 
-    let mut ctx = create_context(icc_cfg, timeout_secs, max_vm_mb);
+    let mut ctx = create_context(icc_cfg, limits);
     ctx.page_filter = page_filter;
     ctx.output_template = output_template;
 
@@ -844,11 +882,10 @@ fn run_pdf_mode(
     _no_aa: bool,
     page_filter: Option<std::collections::HashSet<i32>>,
     page_size: Option<(f64, f64)>,
-    timeout_secs: Option<f64>,
-    max_vm_mb: Option<u64>,
+    limits: &JobLimits,
     output_template: Option<stet_core::output_template::OutputTemplate>,
 ) {
-    let mut ctx = create_context(icc_cfg, timeout_secs, max_vm_mb);
+    let mut ctx = create_context(icc_cfg, limits);
     ctx.page_filter = page_filter;
     let dpi_val = dpi_override.unwrap_or(300.0);
 
@@ -889,8 +926,6 @@ fn run_pdf_mode(
 /// Run in null device mode — no rendering output, no user interaction.
 ///
 /// Useful for running test suites and scripts that don't produce pages.
-// One parameter per CLI option, matching run_png_mode above.
-#[expect(clippy::too_many_arguments)]
 fn run_null_mode(
     dpi_override: Option<f64>,
     file_args: Vec<String>,
@@ -898,12 +933,11 @@ fn run_null_mode(
     _no_aa: bool,
     page_filter: Option<std::collections::HashSet<i32>>,
     page_size: Option<(f64, f64)>,
-    timeout_secs: Option<f64>,
-    max_vm_mb: Option<u64>,
+    limits: &JobLimits,
 ) {
     use stet_core::device::NullDevice;
 
-    let mut ctx = create_context(icc_cfg, timeout_secs, max_vm_mb);
+    let mut ctx = create_context(icc_cfg, limits);
     ctx.page_filter = page_filter;
     ctx.device_factory = Some(Box::new(|w, h| Box::new(NullDevice::new(w, h))));
 
@@ -938,8 +972,7 @@ fn run_viewer_mode(
     page_filter: Option<std::collections::HashSet<i32>>,
     cli_password: Option<String>,
     page_size: Option<(f64, f64)>,
-    timeout_secs: Option<f64>,
-    max_vm_mb: Option<u64>,
+    limits: &JobLimits,
 ) {
     use stet_core::device::NullDevice;
 
@@ -1029,14 +1062,13 @@ fn run_viewer_mode(
     // Spawn interpreter thread
     let _screen_info_receiver = interp_end.screen_info_receiver;
     let icc_cfg_thread = icc_cfg.clone();
-    let timeout_secs_thread = timeout_secs;
-    let max_vm_mb_thread = max_vm_mb;
+    let limits_thread = limits.clone();
     let interrupt_flag_thread = interrupt_flag.clone();
     let password_response_rx_thread = password_response_rx;
     let page_sender_thread = page_sender_for_interp;
     let cli_password_thread = cli_password;
     std::thread::spawn(move || {
-        let mut ctx = create_context(&icc_cfg_thread, timeout_secs_thread, max_vm_mb_thread);
+        let mut ctx = create_context(&icc_cfg_thread, &limits_thread);
         ctx.page_filter = page_filter;
         ctx.interrupt_flag = Some(interrupt_flag_thread.clone());
 
@@ -1368,9 +1400,31 @@ Common options:
                             Defaults to 8192; exceeding it raises VMerror
                             rather than aborting. Separate from the renderer's
                             image and band buffers.
+    --max-page-size <PT>    Largest page side PostScript/EPS input may
+                            declare, in points (default 14400, 200 inches).
+                            A larger page is clamped and loses what lies
+                            beyond it; \"inf\" removes the limit. Raise it
+                            for large-format artwork: Illustrator artboards
+                            reach 16383 pt. The render resolution is not
+                            capped either way.
     --timeout <SECONDS>     Abort a job running longer than this. PostScript is
                             Turing-complete, so there is no limit by default;
                             set one when the input is untrusted.
+    --safer                 Restrict PostScript's file operators, as
+                            Ghostscript's -dSAFER does: a program reads only
+                            stet's resources and the installed fonts, and
+                            writes, deletes and renames nothing. Fonts and
+                            colour profiles stet finds itself are still used,
+                            so pages render the same. Output (-o) is not
+                            affected.
+    --permit-read <PATH>    Let programs read PATH: a folder and everything
+                            in it, or one file. Implies --safer; may be given
+                            more than once. Ghostscript's --permit-file-read.
+    --permit-write <PATH>   Let programs write PATH; a file need not exist
+                            yet. Otherwise as --permit-read.
+    --permit-control <PATH> Let programs delete and rename files in PATH.
+                            Otherwise as --permit-read.
+    --permit-all <PATH>     --permit-read, --permit-write and --permit-control.
     --width <PX>            Override page width (PDF input only). Cannot
                             be combined with --dpi.
     --height <PX>           Override page height (PDF input only). Cannot
@@ -1583,17 +1637,67 @@ fn validate_cmyk_icc(bytes: &[u8], path: &str) {
 }
 
 /// Create and initialize a Context with the resource system.
-fn create_context(
-    icc_cfg: &IccCliConfig,
+/// `--safer` and the `--permit-…` flags, for the main command line and
+/// `stet text` alike. Returns how many arguments `args[i]` took, or `None`
+/// when it is not one of these flags. Exits on a missing value, or a
+/// permit for a folder that does not exist.
+fn file_access_flag(
+    args: &[String],
+    i: usize,
+    file_access: &mut FileAccess,
+    file_permits: &mut FilePermits,
+) -> Option<usize> {
+    let flag = args[i].as_str();
+    let accesses: &[Access] = match flag {
+        "--safer" => {
+            *file_access = FileAccess::Safer;
+            return Some(1);
+        }
+        "--permit-read" => &[Access::Read],
+        "--permit-write" => &[Access::Write],
+        "--permit-control" => &[Access::Control],
+        "--permit-all" => &[Access::Read, Access::Write, Access::Control],
+        _ => return None,
+    };
+    let Some(path) = args.get(i + 1) else {
+        eprintln!("Error: {flag} requires a file or folder");
+        std::process::exit(1);
+    };
+    for &access in accesses {
+        if let Err(e) = file_permits.add(access, path) {
+            eprintln!("Error: {flag}: {e}");
+            std::process::exit(1);
+        }
+    }
+    // A permit is only meaningful with the rest refused.
+    *file_access = FileAccess::Safer;
+    Some(2)
+}
+
+/// What a job may take: time, memory, and files on the host. Parsed once
+/// from the command line and applied to each job's context by
+/// [`create_context`].
+#[derive(Clone, Default)]
+struct JobLimits {
     timeout_secs: Option<f64>,
     max_vm_mb: Option<u64>,
-) -> Context {
+    /// `--max-page-size`, in points.
+    max_page_size_points: Option<f64>,
+    /// `--safer` or any `--permit-…`.
+    file_access: FileAccess,
+    file_permits: FilePermits,
+}
+
+fn create_context(icc_cfg: &IccCliConfig, limits: &JobLimits) -> Context {
     let mut ctx = Context::new();
     // Armed here rather than at the call sites: each mode builds its context
     // once per job, so "from now" is the start of the job's interpretation.
-    ctx.set_timeout(timeout_secs.map(std::time::Duration::from_secs_f64));
-    if let Some(mb) = max_vm_mb {
+    ctx.set_timeout(limits.timeout_secs.map(std::time::Duration::from_secs_f64));
+    if let Some(mb) = limits.max_vm_mb {
         ctx.max_local_vm = (mb as usize).saturating_mul(1024 * 1024);
+    }
+    if let Some(points) = limits.max_page_size_points {
+        ctx.max_page_size_points = points;
     }
     // Replace the default IccCache with one configured per the CLI options.
     // This is where `--bpc` lands; commits 2-3 of docs/PLAN-BPC.md will turn
@@ -1623,6 +1727,10 @@ fn create_context(
 
     // Run init scripts to bootstrap the resource system.
     run_init_scripts(&mut ctx);
+
+    // After initialization, whose scripts are stet's own.
+    ctx.file_access = limits.file_access;
+    ctx.file_permits = limits.file_permits.clone();
 
     ctx
 }
@@ -3062,10 +3170,18 @@ fn run_text_subcommand(args: &[String]) -> i32 {
         json: false,
         word_boxes: false,
         output: None,
+        file_access: FileAccess::Full,
+        file_permits: FilePermits::new(),
     };
     let mut path: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
+        if let Some(taken) =
+            file_access_flag(args, i, &mut options.file_access, &mut options.file_permits)
+        {
+            i += taken;
+            continue;
+        }
         match args[i].as_str() {
             "--pages" => {
                 let Some(spec) = args.get(i + 1) else {
