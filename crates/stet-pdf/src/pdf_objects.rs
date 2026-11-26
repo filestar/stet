@@ -13,7 +13,10 @@ fn write_name(out: &mut Vec<u8>, n: &[u8]) {
     for &b in n {
         if b > b' '
             && b < 127
-            && !matches!(b, b'#' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+            && !matches!(
+                b,
+                b'#' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+            )
         {
             out.push(b);
         } else {
@@ -41,7 +44,10 @@ mod name_tests {
             (b"a b".to_vec(), PdfObj::Int(4)),
             (b"Type".to_vec(), PdfObj::name("Font")),
         ]);
-        assert_eq!(written(&d), "<</#28 1\n/#2F 2\n/#0E 3\n/a#20b 4\n/Type /Font\n>>");
+        assert_eq!(
+            written(&d),
+            "<</#28 1\n/#2F 2\n/#0E 3\n/a#20b 4\n/Type /Font\n>>"
+        );
         assert_eq!(written(&PdfObj::Name(b"%x".to_vec())), "/#25x");
     }
 }
