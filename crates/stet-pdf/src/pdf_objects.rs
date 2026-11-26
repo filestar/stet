@@ -6,6 +6,52 @@
 
 use std::io::Write;
 
+/// Write `/name`, with every byte that is not a regular character (white space, a delimiter, `#`, or outside
+/// `!`..`~`) as `#XX` (PDF 32000-1, 7.3.5).
+fn write_name(out: &mut Vec<u8>, n: &[u8]) {
+    out.push(b'/');
+    for &b in n {
+        if b > b' '
+            && b < 127
+            && !matches!(
+                b,
+                b'#' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+            )
+        {
+            out.push(b);
+        } else {
+            write!(out, "#{:02X}", b).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::PdfObj;
+
+    fn written(o: &PdfObj) -> String {
+        let mut v = Vec::new();
+        o.write_to(&mut v);
+        String::from_utf8(v).unwrap()
+    }
+
+    #[test]
+    fn dictionary_keys_are_escaped_like_names() {
+        let d = PdfObj::Dict(vec![
+            (b"(".to_vec(), PdfObj::Int(1)),
+            (b"/".to_vec(), PdfObj::Int(2)),
+            (vec![0x0e], PdfObj::Int(3)),
+            (b"a b".to_vec(), PdfObj::Int(4)),
+            (b"Type".to_vec(), PdfObj::name("Font")),
+        ]);
+        assert_eq!(
+            written(&d),
+            "<</#28 1\n/#2F 2\n/#0E 3\n/a#20b 4\n/Type /Font\n>>"
+        );
+        assert_eq!(written(&PdfObj::Name(b"%x".to_vec())), "/#25x");
+    }
+}
+
 /// A PDF object value.
 #[allow(dead_code)]
 pub enum PdfObj {
@@ -35,29 +81,7 @@ impl PdfObj {
             }
             PdfObj::Int(n) => write!(out, "{}", n).unwrap(),
             PdfObj::Real(f) => fmt_real(out, *f),
-            PdfObj::Name(n) => {
-                out.push(b'/');
-                for &b in n {
-                    if b > b' '
-                        && b < 127
-                        && b != b'#'
-                        && b != b'('
-                        && b != b')'
-                        && b != b'<'
-                        && b != b'>'
-                        && b != b'['
-                        && b != b']'
-                        && b != b'{'
-                        && b != b'}'
-                        && b != b'/'
-                        && b != b'%'
-                    {
-                        out.push(b);
-                    } else {
-                        write!(out, "#{:02X}", b).unwrap();
-                    }
-                }
-            }
+            PdfObj::Name(n) => write_name(out, n),
             PdfObj::LitString(s) => {
                 out.push(b'(');
                 for &b in s {
@@ -91,8 +115,9 @@ impl PdfObj {
             PdfObj::Dict(entries) => {
                 out.extend(b"<<");
                 for (key, val) in entries {
-                    out.push(b'/');
-                    out.extend(key);
+                    // A key is a name too: a Type 3 font's /CharProcs uses its glyph names as keys, and dvips
+                    // names its bitmap glyphs with single characters such as `(`, `/` or control codes.
+                    write_name(out, key);
                     out.push(b' ');
                     val.write_to(out);
                     out.push(b'\n');
